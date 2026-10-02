@@ -17,6 +17,8 @@ TIMEZONE_OFFSET = datetime.timezone(datetime.timedelta(hours=8))
 
 # 严格的 YYYY-MM-DDTHH:mm 定宽格式（拒绝秒、时区后缀、非零填充等）。
 TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+# 严格零填充的 YYYY-MM-DD 日期格式。
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 POSITIVE_INT_RE = re.compile(r"^\d+$")
 
 
@@ -60,6 +62,16 @@ def parse_time(text):
     return parsed.replace(tzinfo=TIMEZONE_OFFSET)
 
 
+def parse_date(text):
+    """严格解析零填充 YYYY-MM-DD，返回 date。"""
+    if text is None or not DATE_RE.match(text):
+        raise UsageError("expected YYYY-MM-DD")
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise UsageError("invalid date")
+
+
 def build_parser():
     parser = _Parser(prog="booking", add_help=True)
     parser.add_argument("--db", required=True, help="SQLite 数据库文件路径")
@@ -75,6 +87,10 @@ def build_parser():
 
     p_cancel = subparsers.add_parser("cancel")
     p_cancel.add_argument("--booking", required=True)
+
+    p_day_query = subparsers.add_parser("day-query")
+    p_day_query.add_argument("--resource", required=True)
+    p_day_query.add_argument("--date", required=True)
 
     return parser
 
@@ -98,6 +114,15 @@ def main(argv):
             start, end = args.start, args.end
         elif args.command == "cancel":
             booking_id = parse_positive_int(args.booking)
+        elif args.command == "day-query":
+            resource_id = parse_positive_int(args.resource)
+            day = parse_date(args.date)
+            day_start_dt = datetime.datetime.combine(
+                day, datetime.time.min, TIMEZONE_OFFSET
+            )
+            day_end_dt = day_start_dt + datetime.timedelta(days=1)
+            day_start = day_start_dt.strftime("%Y-%m-%dT%H:%M")
+            day_end = day_end_dt.strftime("%Y-%m-%dT%H:%M")
         else:  # pragma: no cover - argparse 已保证
             raise UsageError("unknown command")
     except UsageError:
@@ -116,6 +141,22 @@ def main(argv):
             if not store.cancel_booking(conn, booking_id):
                 return _emit({"error": "booking_not_found"}, 2)
             return _emit({"booking_id": booking_id, "cancelled": True}, 0)
+
+        if args.command == "day-query":
+            if not store.resource_exists(conn, resource_id):
+                return _emit({"error": "resource_not_found"}, 2)
+            rows = store.find_day_bookings(conn, resource_id, day_start, day_end)
+            return _emit(
+                {
+                    "resource_id": resource_id,
+                    "date": args.date,
+                    "bookings": [
+                        {"booking_id": row[0], "start": row[1], "end": row[2]}
+                        for row in rows
+                    ],
+                },
+                0,
+            )
 
         booking_id, error = store.insert_booking(
             conn, resource_id, start, end

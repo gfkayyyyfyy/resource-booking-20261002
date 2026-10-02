@@ -94,6 +94,24 @@ def cancel_booking(conn, booking_id):
     return True
 
 
+def find_day_bookings(conn, resource_id, day_start, day_end):
+    """返回该资源与 [day_start, day_end) 有实际交集的未取消预约。
+
+    时间以定宽文本存储，字典序即时间先后；交集判断为左闭右开
+    （start < day_end 且 end > day_start），跨日预约不截断、
+    每条预约至多出现一次。结果按 start、id 升序排列。
+    """
+    return conn.execute(
+        """
+        SELECT id, start, end FROM bookings
+        WHERE resource_id = ? AND cancelled = 0
+          AND start < ? AND end > ?
+        ORDER BY start ASC, id ASC
+        """,
+        (resource_id, day_end, day_start),
+    ).fetchall()
+
+
 def insert_booking(conn, resource_id, start, end):
     """在事务内依次检查资源存在与时段冲突，返回 booking_id。
 
