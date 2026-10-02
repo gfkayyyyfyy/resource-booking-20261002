@@ -73,6 +73,9 @@ def build_parser():
     p_reserve.add_argument("--start", required=True)
     p_reserve.add_argument("--end", required=True)
 
+    p_cancel = subparsers.add_parser("cancel")
+    p_cancel.add_argument("--booking", required=True)
+
     return parser
 
 
@@ -93,6 +96,8 @@ def main(argv):
             if not start_dt < end_dt:
                 raise UsageError("start must be strictly before end")
             start, end = args.start, args.end
+        elif args.command == "cancel":
+            booking_id = parse_positive_int(args.booking)
         else:  # pragma: no cover - argparse 已保证
             raise UsageError("unknown command")
     except UsageError:
@@ -105,6 +110,14 @@ def main(argv):
             resource_id = store.insert_resource(conn, name)
             return _emit(
                 {"resource_id": resource_id, "name": name}, 0
+            )
+
+        if args.command == "cancel":
+            cancelled_id, error = store.cancel_booking(conn, booking_id)
+            if error == "booking_not_found":
+                return _emit({"error": "booking_not_found"}, 2)
+            return _emit(
+                {"booking_id": cancelled_id, "cancelled": True}, 0
             )
 
         booking_id, error = store.insert_booking(

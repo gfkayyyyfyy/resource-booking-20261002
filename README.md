@@ -37,6 +37,14 @@ python -m booking --db demo.sqlite reserve --resource 1 \
 python -m booking --db demo.sqlite reserve --resource 1 \
     --start 2026-10-05T10:00 --end 2026-10-05T11:00
 # {"booking_id": 2, "resource_id": 1, "start": "2026-10-05T10:00", "end": "2026-10-05T11:00"}
+
+# 取消预约 1，被取消的时段随即可以重新预约
+python -m booking --db demo.sqlite cancel --booking 1
+# {"booking_id": 1, "cancelled": true}
+
+python -m booking --db demo.sqlite reserve --resource 1 \
+    --start 2026-10-05T09:00 --end 2026-10-05T10:00
+# {"booking_id": 3, "resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}
 ```
 
 ## 命令
@@ -61,6 +69,19 @@ reserve --resource <resource_id> --start <开始时间> --end <结束时间>
 - 成功返回：`{"booking_id": <正整数>, "resource_id": <正整数>, "start": "...", "end": "..."}`，时间按输入格式原样返回。
 - `booking_id` 为正整数，在同一数据库内唯一且稳定。
 
+### cancel —— 取消预约
+
+```
+cancel --booking <booking_id>
+```
+
+- 按预约标识取消；被取消的时段不再参与冲突判断，可以重新预约。
+- 取消结果持久化，重新启动进程后仍然有效；取消不改变资源信息或其他预约。
+- 过去日期和跨日预约同样允许取消。
+- 预约不存在或已经取消时统一返回 `booking_not_found`，不改变已有记录。
+- 取消不回收标识：后续预约继续使用新的 `booking_id`，再次取消旧标识不影响后来创建的预约。
+- 成功返回：`{"booking_id": <正整数>, "cancelled": true}`。
+
 ## 时间规则
 
 - 时间统一解释为**固定 UTC+08:00 的本地时间**（不随运行环境时区变化）。
@@ -71,6 +92,7 @@ reserve --resource <resource_id> --start <开始时间> --end <结束时间>
   - 已有 `09:00–10:00` 时，`09:30–10:30` 被拒绝（重叠）；
   - `10:00–11:00` 可以成功（端点相接不算重叠）；
   - 完全相同时段、包含或被包含的时段均被拒绝；
+  - 已取消的预约不参与冲突判断；
   - 不同资源的预约互不影响。
 
 ## 返回结果与错误码
@@ -82,8 +104,13 @@ reserve --resource <resource_id> --start <开始时间> --end <结束时间>
 | 成功 | 见各命令 | `0` |
 | 参数缺失、资源标识不是正整数、名称为空、时间格式或日期无效、起止顺序错误 | `{"error": "invalid_input"}` | `2` |
 | 资源标识不存在 | `{"error": "resource_not_found"}` | `2` |
+| 预约标识不存在或已经取消 | `{"error": "booking_not_found"}` | `2` |
 | 与同一资源已有预约时段重叠 | `{"error": "booking_conflict"}` | `2` |
+
+## 兼容性
+
+旧版本的 SQLite 文件可直接打开：缺少 `cancelled` 列时会自动补齐（已有预约视为未取消），无需重新登记资源或重建数据。
 
 ## 后续规划
 
-资源目录之外，逐步支持开放时段、预约取消、按日查询、简单重复预约和站内提醒。
+资源目录之外，逐步支持开放时段、按日查询、简单重复预约和站内提醒。

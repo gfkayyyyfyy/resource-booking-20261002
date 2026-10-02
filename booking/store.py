@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     resource_id INTEGER NOT NULL,
     start TEXT NOT NULL,
     end TEXT NOT NULL,
+    cancelled INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (resource_id) REFERENCES resources(id)
 );
 """
@@ -27,7 +28,19 @@ def connect(db_path):
     conn.isolation_level = None
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn):
+    """为旧版本数据库补齐后加的列，已有数据原样保留。"""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(bookings)")
+    }
+    if "cancelled" not in columns:
+        conn.execute(
+            "ALTER TABLE bookings ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def insert_resource(conn, name):
@@ -51,11 +64,14 @@ def resource_exists(conn, resource_id):
 
 
 def has_conflict(conn, resource_id, start, end):
-    """同一资源上是否存在与 [start, end) 相交的预约（左闭右开）。"""
+    """同一资源上是否存在与 [start, end) 相交的有效预约（左闭右开）。
+
+    已取消（cancelled = 1）的预约不参与冲突判断。
+    """
     row = conn.execute(
         """
         SELECT 1 FROM bookings
-        WHERE resource_id = ? AND start < ? AND end > ?
+        WHERE resource_id = ? AND start < ? AND end > ? AND cancelled = 0
         LIMIT 1
         """,
         (resource_id, end, start),
@@ -83,6 +99,31 @@ def insert_booking(conn, resource_id, start, end):
             (resource_id, start, end),
         )
         booking_id = cur.lastrowid
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return booking_id, None
+
+
+def cancel_booking(conn, booking_id):
+    """在事务内取消指定预约，返回 (booking_id, None)。
+
+    预约不存在或已经取消时返回 (None, "booking_not_found")，
+    不改动任何记录。取消是幂等判定之外的一次性状态翻转，
+    AUTOINCREMENT 保证后续预约不复用该标识。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT cancelled FROM bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if row is None or row[0] != 0:
+            conn.rollback()
+            return None, "booking_not_found"
+        conn.execute(
+            "UPDATE bookings SET cancelled = 1 WHERE id = ?", (booking_id,)
+        )
         conn.commit()
     except Exception:
         conn.rollback()
