@@ -94,6 +94,40 @@ def cancel_booking(conn, booking_id):
     return True
 
 
+def query_day_bookings(conn, resource_id, day_start, day_end):
+    """返回指定资源上与 [day_start, day_end) 相交的未取消预约。
+
+    时间为定宽文本，字典序即时间先后；起止时间原样返回，不截断跨日
+    预约。左闭右开：end == day_start 或 start == day_end 的预约均不含。
+    day_end 为 None 时表示不设上界（9999-12-31 的次日无法用日期表示）。
+    只读查询，不写入任何记录。
+    """
+    if day_end is None:
+        rows = conn.execute(
+            """
+            SELECT id, start, end FROM bookings
+            WHERE resource_id = ? AND cancelled = 0
+              AND end > ?
+            ORDER BY start ASC, id ASC
+            """,
+            (resource_id, day_start),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, start, end FROM bookings
+            WHERE resource_id = ? AND cancelled = 0
+              AND start < ? AND end > ?
+            ORDER BY start ASC, id ASC
+            """,
+            (resource_id, day_end, day_start),
+        ).fetchall()
+    return [
+        {"booking_id": row[0], "start": row[1], "end": row[2]}
+        for row in rows
+    ]
+
+
 def insert_booking(conn, resource_id, start, end):
     """在事务内依次检查资源存在与时段冲突，返回 booking_id。
 
