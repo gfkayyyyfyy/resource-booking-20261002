@@ -1,0 +1,131 @@
+"""命令行入口：python -m booking --db <sqlite 文件> <命令> ...
+
+每次业务命令在标准输出打印一个 JSON 对象：
+成功退出码 0，业务失败退出码 2（错误对象见各命令说明）。
+"""
+
+import argparse
+import datetime
+import json
+import re
+import sys
+
+from . import store
+
+# 固定时区：所有输入时间统一解释为 UTC+08:00 本地时间。
+TIMEZONE_OFFSET = datetime.timezone(datetime.timedelta(hours=8))
+
+# 严格的 YYYY-MM-DDTHH:mm 定宽格式（拒绝秒、时区后缀、非零填充等）。
+TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+POSITIVE_INT_RE = re.compile(r"^\d+$")
+
+
+class UsageError(Exception):
+    """参数或输入值不合法。"""
+
+
+class _Parser(argparse.ArgumentParser):
+    """把 argparse 的默认报错（退出码 2 + stderr 文本）转为 UsageError。"""
+
+    def error(self, message):
+        raise UsageError(message)
+
+
+def _emit(payload, exit_code):
+    print(json.dumps(payload, ensure_ascii=False))
+    return exit_code
+
+
+def invalid_input():
+    return _emit({"error": "invalid_input"}, 2)
+
+
+def parse_positive_int(text):
+    if text is None or not POSITIVE_INT_RE.match(text):
+        raise UsageError("expected positive integer")
+    value = int(text)
+    if value <= 0:
+        raise UsageError("expected positive integer")
+    return value
+
+
+def parse_time(text):
+    """严格解析 YYYY-MM-DDTHH:mm，返回带 UTC+08:00 时区的 datetime。"""
+    if text is None or not TIME_RE.match(text):
+        raise UsageError("expected YYYY-MM-DDTHH:mm")
+    try:
+        parsed = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M")
+    except ValueError:
+        raise UsageError("invalid date or time")
+    return parsed.replace(tzinfo=TIMEZONE_OFFSET)
+
+
+def build_parser():
+    parser = _Parser(prog="booking", add_help=True)
+    parser.add_argument("--db", required=True, help="SQLite 数据库文件路径")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_add = subparsers.add_parser("resource-add")
+    p_add.add_argument("--name", required=True)
+
+    p_reserve = subparsers.add_parser("reserve")
+    p_reserve.add_argument("--resource", required=True)
+    p_reserve.add_argument("--start", required=True)
+    p_reserve.add_argument("--end", required=True)
+
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    # 先解析参数并完成全部输入校验，之后才连接/初始化数据库，
+    # 保证非法输入不会新建文件或改动任何记录。
+    try:
+        args = parser.parse_args(argv)
+        if args.command == "resource-add":
+            name = args.name.strip()
+            if not name:
+                raise UsageError("name must not be empty")
+        elif args.command == "reserve":
+            resource_id = parse_positive_int(args.resource)
+            start_dt = parse_time(args.start)
+            end_dt = parse_time(args.end)
+            if not start_dt < end_dt:
+                raise UsageError("start must be strictly before end")
+            start, end = args.start, args.end
+        else:  # pragma: no cover - argparse 已保证
+            raise UsageError("unknown command")
+    except UsageError:
+        return invalid_input()
+
+    # 输入合法后再打开数据库（不存在则初始化），后续进程沿用同一文件。
+    conn = store.connect(args.db)
+    try:
+        if args.command == "resource-add":
+            resource_id = store.insert_resource(conn, name)
+            return _emit(
+                {"resource_id": resource_id, "name": name}, 0
+            )
+
+        booking_id, error = store.insert_booking(
+            conn, resource_id, start, end
+        )
+        if error == "resource_not_found":
+            return _emit({"error": "resource_not_found"}, 2)
+        if error == "booking_conflict":
+            return _emit({"error": "booking_conflict"}, 2)
+        return _emit(
+            {
+                "booking_id": booking_id,
+                "resource_id": resource_id,
+                "start": start,
+                "end": end,
+            },
+            0,
+        )
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
