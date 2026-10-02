@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     resource_id INTEGER NOT NULL,
     start TEXT NOT NULL,
     end TEXT NOT NULL,
+    cancelled INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (resource_id) REFERENCES resources(id)
 );
 """
@@ -27,6 +28,13 @@ def connect(db_path):
     conn.isolation_level = None
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    # 兼容取消功能上线前创建的数据库：补齐 cancelled 列，
+    # 已有预约一律视为未取消，无需重建数据。
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(bookings)")}
+    if "cancelled" not in columns:
+        conn.execute(
+            "ALTER TABLE bookings ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0"
+        )
     return conn
 
 
@@ -51,16 +59,39 @@ def resource_exists(conn, resource_id):
 
 
 def has_conflict(conn, resource_id, start, end):
-    """同一资源上是否存在与 [start, end) 相交的预约（左闭右开）。"""
+    """同一资源上是否存在与 [start, end) 相交的未取消预约（左闭右开）。"""
     row = conn.execute(
         """
         SELECT 1 FROM bookings
-        WHERE resource_id = ? AND start < ? AND end > ?
+        WHERE resource_id = ? AND cancelled = 0
+          AND start < ? AND end > ?
         LIMIT 1
         """,
         (resource_id, end, start),
     ).fetchone()
     return row is not None
+
+
+def cancel_booking(conn, booking_id):
+    """在事务内取消指定预约。
+
+    预约不存在或已经取消返回 False（不改动任何记录）；
+    取消成功返回 True。id 由 AUTOINCREMENT 分配，不复用被取消的标识。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "UPDATE bookings SET cancelled = 1 WHERE id = ? AND cancelled = 0",
+            (booking_id,),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
 
 
 def insert_booking(conn, resource_id, start, end):

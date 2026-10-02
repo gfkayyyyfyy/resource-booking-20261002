@@ -33,10 +33,19 @@ python -m booking --db demo.sqlite reserve --resource 1 \
     --start 2026-10-05T09:30 --end 2026-10-05T10:30
 # {"error": "booking_conflict"}
 
+# 取消预约 1；被取消的时段随后可以重新预约
+python -m booking --db demo.sqlite cancel --booking 1
+# {"booking_id": 1, "cancelled": true}
+
+python -m booking --db demo.sqlite reserve --resource 1 \
+    --start 2026-10-05T09:00 --end 2026-10-05T10:00
+# {"booking_id": 2, "resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}
+# （新预约使用新的 booking_id，不复用被取消的标识）
+
 # 左闭右开：10:00 与上一时段端点相接，不冲突
 python -m booking --db demo.sqlite reserve --resource 1 \
     --start 2026-10-05T10:00 --end 2026-10-05T11:00
-# {"booking_id": 2, "resource_id": 1, "start": "2026-10-05T10:00", "end": "2026-10-05T11:00"}
+# {"booking_id": 3, "resource_id": 1, "start": "2026-10-05T10:00", "end": "2026-10-05T11:00"}
 ```
 
 ## 命令
@@ -61,6 +70,19 @@ reserve --resource <resource_id> --start <开始时间> --end <结束时间>
 - 成功返回：`{"booking_id": <正整数>, "resource_id": <正整数>, "start": "...", "end": "..."}`，时间按输入格式原样返回。
 - `booking_id` 为正整数，在同一数据库内唯一且稳定。
 
+### cancel —— 取消预约
+
+```
+cancel --booking <booking_id>
+```
+
+- 取消指定预约；成功返回：`{"booking_id": <正整数>, "cancelled": true}`。
+- 被取消的时段立即恢复为可预约状态，且该预约不再参与后续冲突判断；取消结果持久化，重启进程后仍然有效。
+- 取消只作用于目标预约，不改变资源信息或其他预约；过去日期与跨日预约同样允许取消。
+- 新预约始终获得新的 `booking_id`（`AUTOINCREMENT`），不复用被取消的标识；再次取消旧标识不影响后来创建的预约。
+- 预约标识不存在或已经取消时，统一返回 `{"error": "booking_not_found"}`，不改动任何记录。
+- 取消功能上线前创建的数据库文件直接兼容：首次打开时自动补齐取消标记列，已有预约一律视为未取消。
+
 ## 时间规则
 
 - 时间统一解释为**固定 UTC+08:00 的本地时间**（不随运行环境时区变化）。
@@ -80,10 +102,11 @@ reserve --resource <resource_id> --start <开始时间> --end <结束时间>
 | 情形 | 返回 | 退出码 |
 | --- | --- | --- |
 | 成功 | 见各命令 | `0` |
-| 参数缺失、资源标识不是正整数、名称为空、时间格式或日期无效、起止顺序错误 | `{"error": "invalid_input"}` | `2` |
+| 参数缺失、资源标识不是正整数、名称为空、时间格式或日期无效、起止顺序错误、预约标识不是正整数（零、负数、小数、非整数） | `{"error": "invalid_input"}` | `2` |
 | 资源标识不存在 | `{"error": "resource_not_found"}` | `2` |
 | 与同一资源已有预约时段重叠 | `{"error": "booking_conflict"}` | `2` |
+| 预约标识不存在或已经取消（仅 cancel） | `{"error": "booking_not_found"}` | `2` |
 
 ## 后续规划
 
-资源目录之外，逐步支持开放时段、预约取消、按日查询、简单重复预约和站内提醒。
+资源目录与预约取消之外，逐步支持开放时段、按日查询、简单重复预约和站内提醒。
