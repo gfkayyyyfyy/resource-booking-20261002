@@ -21,6 +21,9 @@ TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 POSITIVE_INT_RE = re.compile(r"^\d+$")
 
+# SQLite INTEGER 上限的十进制文本，用于不做大整数转换的越界比较。
+_INT64_MAX_TEXT = str(store.SQLITE_INT64_MAX)
+
 
 class UsageError(Exception):
     """参数或输入值不合法。"""
@@ -45,7 +48,16 @@ def invalid_input():
 def parse_positive_int(text):
     if text is None or not POSITIVE_INT_RE.match(text):
         raise UsageError("expected positive integer")
-    value = int(text)
+    # 去掉前导零后按十进制文本比较，避免 int() 的位数上限
+    # （Python 3.11+ 默认 4300 位）在超大标识上抛出 ValueError。
+    digits = text.lstrip("0") or "0"
+    if len(digits) > len(_INT64_MAX_TEXT) or (
+        len(digits) == len(_INT64_MAX_TEXT) and digits > _INT64_MAX_TEXT
+    ):
+        # 超出 SQLite INTEGER 范围的正整数不可能存在于库中，
+        # 归一化为越界哨兵，由持久层统一按“不存在”处理。
+        return store.SQLITE_INT64_MAX + 1
+    value = int(digits)
     if value <= 0:
         raise UsageError("expected positive integer")
     return value

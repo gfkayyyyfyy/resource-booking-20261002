@@ -2,6 +2,11 @@
 
 import sqlite3
 
+# SQLite INTEGER 主键为 64 位有符号整数。超出该范围的标识按现有规则仍是
+# 正整数，但不可能存在于库中，直接按“不存在”处理，避免绑定参数时抛出
+# OverflowError 而破坏“单个 JSON 错误对象 + 退出码 2”的协议。
+SQLITE_INT64_MAX = 9223372036854775807
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS resources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +57,8 @@ def insert_resource(conn, name):
 
 
 def resource_exists(conn, resource_id):
+    if resource_id > SQLITE_INT64_MAX:
+        return False
     row = conn.execute(
         "SELECT 1 FROM resources WHERE id = ?", (resource_id,)
     ).fetchone()
@@ -77,7 +84,10 @@ def cancel_booking(conn, booking_id):
 
     预约不存在或已经取消返回 False（不改动任何记录）；
     取消成功返回 True。id 由 AUTOINCREMENT 分配，不复用被取消的标识。
+    超出 SQLite INTEGER 范围的标识不可能存在，直接返回 False。
     """
+    if booking_id > SQLITE_INT64_MAX:
+        return False
     conn.execute("BEGIN IMMEDIATE")
     try:
         cur = conn.execute(
