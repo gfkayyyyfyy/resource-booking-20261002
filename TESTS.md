@@ -1,6 +1,6 @@
 # 回归测试执行说明
 
-`test_day_query.py` 固定 `day-query` 按日查询的公开行为；`test_cancel_rebook.py` 固定 `cancel` 取消后再次预约这条流程的公开行为（时段释放、新预约不复用旧标识、旧标识与后来预约相互隔离，以及各类失败分支）；`test_reserve_conflict.py` 固定 `reserve` 的左闭右开时段冲突规则（各类相交拒绝、端点相接与不同资源放行、冲突失败不改记录、跨午夜一致性及重开持久化）；`test_legacy_db_compat.py` 固定取消功能上线前旧 SQLite 库的兼容承诺（首次打开自动补齐 cancelled 列、旧预约一律视为有效、取消旧预约后以大于原最大标识的新标识重新预约、重开持久化，以及未打开旧库上非法输入不迁移不改数据）。均仅使用 Python 标准库，无需安装任何依赖。
+`test_day_query.py` 固定 `day-query` 按日查询的公开行为；`test_cancel_rebook.py` 固定 `cancel` 取消后再次预约这条流程的公开行为（时段释放、新预约不复用旧标识、旧标识与后来预约相互隔离，以及各类失败分支）；`test_reserve_conflict.py` 固定 `reserve` 的左闭右开时段冲突规则（各类相交拒绝、端点相接与不同资源放行、冲突失败不改记录、跨午夜一致性及重开持久化）；`test_legacy_db_compat.py` 固定取消功能上线前旧 SQLite 库的兼容承诺（首次打开自动补齐 cancelled 列、旧预约一律视为有效、取消旧预约后以大于原最大标识的新标识重新预约、重开持久化，以及未打开旧库上非法输入不迁移不改数据）；`test_oversized_id.py` 固定超过 SQLite INTEGER 范围（>2^63-1）的超大正整数标识行为（reserve/day-query 返回 resource_not_found、cancel 返回 booking_not_found，五千个 9 与任意前导零按同一数值规则处理，0001 指向标识 1，invalid_input 校验优先级，失败不新增记录/不消耗标识/原预约仍冲突且可取消，非法输入不建文件而越界合法输入与普通未知标识一样初始化/迁移旧库，边界值 2^63-1 走普通查询）。均仅使用 Python 标准库，无需安装任何依赖。
 
 ## 运行
 
@@ -12,6 +12,7 @@ python3 -m unittest test_day_query -v     # 只运行按日查询用例
 python3 -m unittest test_cancel_rebook -v     # 只运行取消后再次预约用例
 python3 -m unittest test_reserve_conflict -v # 只运行时段冲突规则用例
 python3 -m unittest test_legacy_db_compat -v # 只运行旧库兼容承诺用例
+python3 -m unittest test_oversized_id -v     # 只运行超大标识用例
 ```
 
 全部通过时退出码为 0，末行输出 `OK`。

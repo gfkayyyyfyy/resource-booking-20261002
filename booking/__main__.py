@@ -19,7 +19,16 @@ TIMEZONE_OFFSET = datetime.timezone(datetime.timedelta(hours=8))
 TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 # 严格的 YYYY-MM-DD 定宽日期格式。
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# 只接受纯数字文本（允许前导零）；数值上限另行判断。
 POSITIVE_INT_RE = re.compile(r"^\d+$")
+# SQLite INTEGER 主键可表示的最大有符号整数；任何真实存在的资源/预约
+# 标识都不可能超过它，因此更大的正整数一律等价于“标识不存在”。
+SQLITE_MAX_ID = 2 ** 63 - 1
+_SQLITE_MAX_ID_DIGITS = str(SQLITE_MAX_ID)
+
+# 标识为超过 SQLite INTEGER 上限的正整数：输入合法，但该标识必然不存在。
+# 由调用方在全部校验完成后按 not_found 处理，绝不绑定给 SQLite。
+OVERSIZED_ID = object()
 
 
 class UsageError(Exception):
@@ -43,11 +52,27 @@ def invalid_input():
 
 
 def parse_positive_int(text):
+    """解析正整数文本，允许任意长度与前导零（按数值解释）。
+
+    范围：返回 [1, 2^63-1] 内的 int；超过 SQLite INTEGER 上限时返回
+    OVERSIZED_ID（输入合法，但该标识必然不存在）。不把超长数字串直接
+    交给 int()：Python 对超长数字串的转换有位数限制，且标识是否越界
+    只取决于十进制数值，与位数或前导零无关。
+    """
     if text is None or not POSITIVE_INT_RE.match(text):
         raise UsageError("expected positive integer")
-    value = int(text)
-    if value <= 0:
+    # 按数值跳过前导零（\d 可匹配各语种十进制数字，不能只剥 ASCII '0'）。
+    index = 0
+    while index < len(text) and int(text[index]) == 0:
+        index += 1
+    if index == len(text):  # 纯零（含 "0"、"000"）不是正整数。
         raise UsageError("expected positive integer")
+    if len(text) - index > len(_SQLITE_MAX_ID_DIGITS):
+        return OVERSIZED_ID
+    # 剩余至多 19 位，int() 转换不受超长数字串限制。
+    value = int(text[index:])
+    if value > SQLITE_MAX_ID:
+        return OVERSIZED_ID
     return value
 
 
@@ -132,6 +157,18 @@ def main(argv):
     # 输入合法后再打开数据库（不存在则初始化），后续进程沿用同一文件。
     conn = store.connect(args.db)
     try:
+        # 超出 SQLite INTEGER 范围的正整数是合法输入，但真实标识不可能超过
+        # 2^63-1，故在发起任何查询前按“不存在”短路，绝不把超大整数绑定给
+        # SQLite（否则会抛 OverflowError）。此时连接已正常打开，因此合法输入
+        # 原有的建库初始化与旧库兼容行为保持不变；invalid_input 已在连接前
+        # 返回，优先级不受影响。
+        if args.command in ("reserve", "day-query"):
+            if resource_id is OVERSIZED_ID:
+                return _emit({"error": "resource_not_found"}, 2)
+        elif args.command == "cancel":
+            if booking_id is OVERSIZED_ID:
+                return _emit({"error": "booking_not_found"}, 2)
+
         if args.command == "resource-add":
             resource_id = store.insert_resource(conn, name)
             return _emit(
