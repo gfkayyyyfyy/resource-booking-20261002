@@ -20,7 +20,10 @@ TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 # 严格的 YYYY-MM-DD 定宽日期格式。
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # 只接受纯数字文本（允许前导零）；数值上限另行判断。
-POSITIVE_INT_RE = re.compile(r"^\d+$")
+# 必须用 \Z 而非 $：Python 正则中 $ 允许在末尾换行符之前匹配，
+# 否则 "1\n" 会被当成 1、"0\n" 会绕过正则后在 int() 处抛出 ValueError。
+# \Z 只在字符串真正末尾匹配，首尾空白、制表符、CR 与数字中间的换行均不匹配。
+POSITIVE_INT_RE = re.compile(r"^\d+\Z")
 # SQLite INTEGER 主键可表示的最大有符号整数；任何真实存在的资源/预约
 # 标识都不可能超过它，因此更大的正整数一律等价于“标识不存在”。
 SQLITE_MAX_ID = 2 ** 63 - 1
