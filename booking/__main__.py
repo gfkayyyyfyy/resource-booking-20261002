@@ -113,6 +113,8 @@ def build_parser():
     p_cancel = subparsers.add_parser("cancel")
     p_cancel.add_argument("--booking", required=True)
 
+    subparsers.add_parser("resource-list")
+
     p_day_query = subparsers.add_parser("day-query")
     p_day_query.add_argument("--resource", required=True)
     p_day_query.add_argument("--date", required=True)
@@ -139,6 +141,8 @@ def main(argv):
             start, end = args.start, args.end
         elif args.command == "cancel":
             booking_id = parse_positive_int(args.booking)
+        elif args.command == "resource-list":
+            pass  # 无额外参数，无需校验
         elif args.command == "day-query":
             resource_id = parse_positive_int(args.resource)
             day = parse_date(args.date)
@@ -174,6 +178,9 @@ def main(argv):
             return _emit(
                 {"resource_id": resource_id, "name": name}, 0
             )
+
+        if args.command == "resource-list":
+            return _emit({"resources": store.list_resources(conn)}, 0)
 
         if args.command == "cancel":
             if not store.cancel_booking(conn, booking_id):
