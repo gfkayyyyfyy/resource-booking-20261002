@@ -51,6 +51,18 @@ def insert_resource(conn, name):
     return resource_id
 
 
+def list_resources(conn):
+    """返回全部资源，按资源标识数值升序。
+
+    每项只含 resource_id 与 name，名称取数据库中保存的原值，
+    不去空白、不合并同名项。只读查询，不写入任何记录。
+    """
+    rows = conn.execute(
+        "SELECT id, name FROM resources ORDER BY id ASC"
+    ).fetchall()
+    return [{"resource_id": row[0], "name": row[1]} for row in rows]
+
+
 def resource_exists(conn, resource_id):
     row = conn.execute(
         "SELECT 1 FROM resources WHERE id = ?", (resource_id,)

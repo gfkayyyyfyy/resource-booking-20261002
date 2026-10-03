@@ -105,6 +105,9 @@ def build_parser():
     p_add = subparsers.add_parser("resource-add")
     p_add.add_argument("--name", required=True)
 
+    # 资源目录查询：无任何选项或位置参数。
+    subparsers.add_parser("resource-list")
+
     p_reserve = subparsers.add_parser("reserve")
     p_reserve.add_argument("--resource", required=True)
     p_reserve.add_argument("--start", required=True)
@@ -130,6 +133,8 @@ def main(argv):
             name = args.name.strip()
             if not name:
                 raise UsageError("name must not be empty")
+        elif args.command == "resource-list":
+            pass  # 无需校验任何参数；多余参数已被 argparse 拒绝。
         elif args.command == "reserve":
             resource_id = parse_positive_int(args.resource)
             start_dt = parse_time(args.start)
@@ -174,6 +179,9 @@ def main(argv):
             return _emit(
                 {"resource_id": resource_id, "name": name}, 0
             )
+
+        if args.command == "resource-list":
+            return _emit({"resources": store.list_resources(conn)}, 0)
 
         if args.command == "cancel":
             if not store.cancel_booking(conn, booking_id):
