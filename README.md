@@ -120,6 +120,15 @@ day-query --resource <resource_id> --date <YYYY-MM-DD>
 | 与同一资源已有预约时段重叠 | `{"error": "booking_conflict"}` | `2` |
 | 预约标识不存在或已经取消（仅 cancel） | `{"error": "booking_not_found"}` | `2` |
 
+## 回归测试
+
+`test_day_query.py` 固定了 `day-query` 的公开行为（排序、跨日不截断、边界排除、取消持久化、错误码与退出码等）。仅使用标准库 `unittest`，每个用例使用独立的临时 SQLite 数据库并在结束后清理，不依赖已有数据库、当前日期或机器时区。在项目根目录执行：
+
+```sh
+python -m unittest -v            # 发现并运行全部测试
+python -m unittest test_day_query -v   # 只运行该测试模块
+```
+
 ## 后续规划
 
 资源目录与预约取消之外，逐步支持开放时段、按日查询、简单重复预约和站内提醒。
