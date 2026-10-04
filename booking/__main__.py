@@ -16,9 +16,12 @@ from . import store
 TIMEZONE_OFFSET = datetime.timezone(datetime.timedelta(hours=8))
 
 # 严格的 YYYY-MM-DDTHH:mm 定宽格式（拒绝秒、时区后缀、非零填充等）。
-TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
-# 严格的 YYYY-MM-DD 定宽日期格式。
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# 数字只接受 ASCII 0-9：\d 会匹配全角、阿拉伯文等各语种十进制数字，
+# 而 strptime 同样接受它们，会让 "２０２６-10-05T09:00" 之类的文本绕过
+# 冲突判断或漏掉查询结果；与 ASCII 数字混写的文本也一并拒绝，不做转换。
+TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$")
+# 严格的 YYYY-MM-DD 定宽日期格式，数字同样只接受 ASCII 0-9。
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 # 只接受纯数字文本（允许前导零）；数值上限另行判断。
 # 必须用 \Z 锚定字符串绝对结尾，不能用 $：$ 允许在末尾 LF 之前匹配，
 # 会让 "1\n" 被当成 1、"0\n" 进入纯零分支后触发未捕获的 ValueError。
@@ -137,7 +140,11 @@ def parse_repeat_weeks(text):
 
 
 def parse_time(text):
-    """严格解析 YYYY-MM-DDTHH:mm，返回带 UTC+08:00 时区的 datetime。"""
+    """严格解析 YYYY-MM-DDTHH:mm，返回带 UTC+08:00 时区的 datetime。
+
+    数字只接受 ASCII 0-9：全角、阿拉伯文等 Unicode 十进制数字及其与
+    ASCII 数字的混写一律拒绝，不做归一化或自动转换。
+    """
     if text is None or not TIME_RE.match(text):
         raise UsageError("expected YYYY-MM-DDTHH:mm")
     try:
@@ -151,8 +158,8 @@ def parse_time_window(start_text, end_text):
     """校验 reserve/free-query 共用的时间窗口规则，返回原始 (start, end) 文本。
 
     两个入口共同的时间窗口规则只在此维护：先后严格解析开始与结束文本
-    （固定 UTC+08:00、零填充 YYYY-MM-DDTHH:mm，拒绝秒、时区后缀与首尾
-    空白，非法日期由 parse_time 拒绝），并要求开始严格早于结束；起止
+    （固定 UTC+08:00、零填充 YYYY-MM-DDTHH:mm，数字仅 ASCII 0-9，拒绝秒、
+    时区后缀与首尾空白，非法日期由 parse_time 拒绝），并要求开始严格早于结束；起止
     相等或颠倒都抛 UsageError。过去日期与跨午夜窗口不在此限制，继续
     合法。成功时返回入参原文：成功结果顶层原样回显，定宽文本也直接
     交给存储层（字典序即时间先后）。
@@ -165,7 +172,10 @@ def parse_time_window(start_text, end_text):
 
 
 def parse_date(text):
-    """严格解析零填充 YYYY-MM-DD，返回带 UTC+08:00 时区的 date。"""
+    """严格解析零填充 YYYY-MM-DD，返回带 UTC+08:00 时区的 date。
+
+    数字只接受 ASCII 0-9，非 ASCII 十进制数字及混写文本一律拒绝。
+    """
     if text is None or not DATE_RE.match(text):
         raise UsageError("expected YYYY-MM-DD")
     try:
