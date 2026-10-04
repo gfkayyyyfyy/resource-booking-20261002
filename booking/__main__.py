@@ -24,19 +24,18 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # 会让 "1\n" 被当成 1、"0\n" 进入纯零分支后触发未捕获的 ValueError。
 # \Z 不接受任何尾随字符，首尾空白、制表符、CR 或夹在数字中间的 LF 一律拒绝。
 POSITIVE_INT_RE = re.compile(r"^\d+\Z")
-# --min-minutes 只接受 ASCII 数字文本（\d 会匹配各语种十进制数字，
-# 这里必须用 [0-9]）；同样用 \Z 锚定绝对结尾，拒绝任何首尾/夹带空白。
-MIN_MINUTES_RE = re.compile(r"^[0-9]+\Z")
-# --min-minutes 的取值上限：一天 24 小时的分钟数。
+# --min-minutes 与 --repeat-weeks 共同的数值文本规则只维护这一份：
+# 只接受非空 ASCII 十进制数字（\d 会匹配各语种十进制数字，必须用 [0-9]），
+# 允许任意数量前导零、按实际数值解释；各自的取值范围在解析函数处判断。
+# 必须用 \Z 锚定字符串绝对结尾，不能用 $：$ 允许在末尾 LF 之前匹配，
+# 会让 "1\n" 被当成 1、"0\n" 进入纯零分支后触发未捕获的 ValueError。
+# \Z 不接受任何尾随字符，首尾空白、制表符、CR 或夹在数字中间的 LF 一律拒绝。
+BOUNDED_ASCII_INT_RE = re.compile(r"^[0-9]+\Z")
+# --min-minutes 的取值上限：一天 24 小时的分钟数（范围 1 至 1440）。
 MAX_MIN_MINUTES = 1440
-_MAX_MIN_MINUTES_DIGITS = str(MAX_MIN_MINUTES)
-# --repeat-weeks 只接受 ASCII 数字文本（同 MIN_MINUTES_RE 的理由），
-# 用 \Z 锚定绝对结尾，拒绝任何首尾/夹带空白。
-REPEAT_WEEKS_RE = re.compile(r"^[0-9]+\Z")
 # --repeat-weeks 的取值范围：包含首次在内的总次数 2 至 8。
 MIN_REPEAT_WEEKS = 2
 MAX_REPEAT_WEEKS = 8
-_MAX_REPEAT_WEEKS_DIGITS = str(MAX_REPEAT_WEEKS)
 # SQLite INTEGER 主键可表示的最大有符号整数；任何真实存在的资源/预约
 # 标识都不可能超过它，因此更大的正整数一律等价于“标识不存在”。
 SQLITE_MAX_ID = 2 ** 63 - 1
@@ -92,47 +91,49 @@ def parse_positive_int(text):
     return value
 
 
+def parse_bounded_ascii_int(text, lower, upper, message):
+    """解析有界 ASCII 十进制整数文本，允许任意数量前导零（按数值解释）。
+
+    --min-minutes 与 --repeat-weeks 共同的输入校验规则只在此维护：缺值、
+    空文本、纯零、负数、小数、含空格/制表符/换行或非 ASCII 数字（全角、
+    阿拉伯文等）的文本，以及数值不在 [lower, upper] 内，一律抛 UsageError。
+    先剥前导零再按位数判断，不把超长数字串直接交给 int()（Python 对超长
+    数字串的转换有位数限制），故五千个 9 之类的输入也走同一非法路径。
+    """
+    if text is None or not BOUNDED_ASCII_INT_RE.match(text):
+        raise UsageError(message)
+    stripped = text.lstrip("0")
+    if not stripped or len(stripped) > len(str(upper)):
+        # 纯零（含 "0"、"000"）或剥零后位数已多于上限：都不在范围内。
+        raise UsageError(message)
+    # 剩余位数与上限同级，int() 转换不受超长数字串限制。
+    value = int(stripped)
+    if not lower <= value <= upper:
+        raise UsageError(message)
+    return value
+
+
 def parse_min_minutes(text):
     """解析 --min-minutes：1 至 1440 的十进制整数文本，允许前导零。
 
-    只接受 ASCII 数字；空文本、纯零、负数、小数、超出范围或含空白等
-    其他字符一律视为非法输入。先剥前导零再按位数判断，不把超长数字串
-    直接交给 int()（Python 对超长数字串的转换有位数限制）。
+    文本规则见 parse_bounded_ascii_int；范围含义为本参数独有。
     """
-    if text is None or not MIN_MINUTES_RE.match(text):
-        raise UsageError("expected integer minutes in [1, 1440]")
-    stripped = text.lstrip("0")
-    if not stripped:  # 纯零（含 "0"、"000"）不在 [1, 1440] 内。
-        raise UsageError("expected integer minutes in [1, 1440]")
-    if len(stripped) > len(_MAX_MIN_MINUTES_DIGITS):
-        raise UsageError("expected integer minutes in [1, 1440]")
-    # 剩余至多 4 位，int() 转换不受超长数字串限制。
-    value = int(stripped)
-    if not 1 <= value <= MAX_MIN_MINUTES:
-        raise UsageError("expected integer minutes in [1, 1440]")
-    return value
+    return parse_bounded_ascii_int(
+        text, 1, MAX_MIN_MINUTES, "expected integer minutes in [1, 1440]"
+    )
 
 
 def parse_repeat_weeks(text):
     """解析 --repeat-weeks：2 至 8 的 ASCII 十进制整数文本，允许前导零。
 
-    只接受 ASCII 数字；缺值、空文本、纯零、负数、小数、超出 [2, 8] 或
-    含空白及其他字符（含非 ASCII 数字）一律视为非法输入。先剥前导零再
-    按位数判断，不把超长数字串直接交给 int()（Python 对超长数字串的
-    转换有位数限制）。
+    文本规则见 parse_bounded_ascii_int；[2, 8] 表示包含首次在内的总次数。
     """
-    if text is None or not REPEAT_WEEKS_RE.match(text):
-        raise UsageError("expected integer repeat count in [2, 8]")
-    stripped = text.lstrip("0")
-    if not stripped:  # 纯零（含 "0"、"000"）不在 [2, 8] 内。
-        raise UsageError("expected integer repeat count in [2, 8]")
-    if len(stripped) > len(_MAX_REPEAT_WEEKS_DIGITS):
-        raise UsageError("expected integer repeat count in [2, 8]")
-    # 剩余至多 1 位，int() 转换不受超长数字串限制。
-    value = int(stripped)
-    if not MIN_REPEAT_WEEKS <= value <= MAX_REPEAT_WEEKS:
-        raise UsageError("expected integer repeat count in [2, 8]")
-    return value
+    return parse_bounded_ascii_int(
+        text,
+        MIN_REPEAT_WEEKS,
+        MAX_REPEAT_WEEKS,
+        "expected integer repeat count in [2, 8]",
+    )
 
 
 def parse_time(text):
