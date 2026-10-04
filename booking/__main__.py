@@ -242,6 +242,10 @@ def build_parser():
     p_free_query.add_argument("--end", required=True)
     # 可选：只保留窗口内连续分钟数不低于该值的空闲区间；缺省不过滤。
     p_free_query.add_argument("--min-minutes", default=None)
+    # 可选无值开关：只返回开始时间最早的一个空闲区间；缺省返回全部。
+    # store_true 不消费下一个参数，故 --first-only 后追加任何值都会被
+    # argparse 按未知位置参数/显式赋值拒绝，走统一的 invalid_input。
+    p_free_query.add_argument("--first-only", action="store_true", default=False)
 
     return parser
 
@@ -293,6 +297,9 @@ def main(argv):
             min_minutes = None
             if args.min_minutes is not None:
                 min_minutes = parse_min_minutes(args.min_minutes)
+            # --first-only 为无值布尔开关，argparse 已保证其值为 True/False；
+            # 给开关附加值（--first-only 30、--first-only=x）在解析阶段即拒绝。
+            first_only = args.first_only
         else:  # pragma: no cover - argparse 已保证
             raise UsageError("unknown command")
     except UsageError:
@@ -346,7 +353,7 @@ def main(argv):
             if not store.resource_exists(conn, resource_id):
                 return _emit({"error": "resource_not_found"}, 2)
             free_slots = store.query_free_slots(
-                conn, resource_id, start, end, min_minutes
+                conn, resource_id, start, end, min_minutes, first_only
             )
             return _emit(
                 {

@@ -150,7 +150,8 @@ def query_day_bookings(conn, resource_id, day_start, day_end):
     ]
 
 
-def query_free_slots(conn, resource_id, start, end, min_minutes=None):
+def query_free_slots(conn, resource_id, start, end, min_minutes=None,
+                     first_only=False):
     """返回 [start, end) 内全部最大连续空闲区间，按开始时间升序。
 
     只统计同一资源的未取消预约；跨出窗口的预约只按相交部分截断。
@@ -158,6 +159,9 @@ def query_free_slots(conn, resource_id, start, end, min_minutes=None):
     占用时段。每项只含 start 与 end（完整日期时间文本）。
     min_minutes 不为 None 时，只保留窗口内连续分钟数不低于该值的区间；
     合格区间保留完整起止端点，不截成指定长度、不拆分、不跨占用拼接。
+    first_only 为 True 时，在最小时长筛选之后只保留开始时间最早的
+    一项（筛选使首项过短时继续取后续达标的最早一项）；没有合格区间时
+    仍是空列表。合格区间保留完整端点，不截成指定时长。
     只读查询，不写入任何记录。
     """
     rows = conn.execute(
@@ -188,6 +192,10 @@ def query_free_slots(conn, resource_id, start, end, min_minutes=None):
             for slot in free_slots
             if _minutes_between(slot["start"], slot["end"]) >= min_minutes
         ]
+    if first_only:
+        # 区间本就按开始时间升序，先按时长筛选（上面）再取首项：
+        # 最早区间过短时自然继续取后续最早的达标区间。
+        free_slots = free_slots[:1]
     return free_slots
 
 
