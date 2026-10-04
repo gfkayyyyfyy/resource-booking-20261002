@@ -197,7 +197,10 @@ def _minutes_between(start, end):
 
 
 def insert_bookings(conn, resource_id, intervals):
-    """在单个事务内为同一资源创建多条预约：全部成功或全部失败。
+    """在单个事务内为同一资源创建一条或多条预约：全部成功或全部失败。
+
+    单次预约与每周重复预约共同的创建规则只在此维护：资源存在性检查、
+    冲突检查与写入都走这一条路径，insert_booking 即本函数的单区间情形。
 
     intervals 为按发生时间升序的 (start, end) 定宽文本对。依次检查资源
     存在、生成区间彼此不重叠（左闭右开，端点相接不冲突）以及与同资源
@@ -242,22 +245,11 @@ def insert_booking(conn, resource_id, start, end):
     返回 (booking_id, None)；资源不存在返回 (None, "resource_not_found")；
     时段冲突返回 (None, "booking_conflict")。失败时回滚，不改动任何记录。
     时间以定宽文本存储，字典序即时间先后。
+
+    单次预约即 insert_bookings 的单区间情形，资源检查、冲突处理与保存
+    的共同规则集中在 insert_bookings 维护，此处只做返回结构的展开。
     """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        if not resource_exists(conn, resource_id):
-            conn.rollback()
-            return None, "resource_not_found"
-        if has_conflict(conn, resource_id, start, end):
-            conn.rollback()
-            return None, "booking_conflict"
-        cur = conn.execute(
-            "INSERT INTO bookings (resource_id, start, end) VALUES (?, ?, ?)",
-            (resource_id, start, end),
-        )
-        booking_id = cur.lastrowid
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return booking_id, None
+    booking_ids, error = insert_bookings(conn, resource_id, [(start, end)])
+    if error is not None:
+        return None, error
+    return booking_ids[0], None
