@@ -140,6 +140,39 @@ def query_day_bookings(conn, resource_id, day_start, day_end):
     ]
 
 
+def query_free_slots(conn, resource_id, start, end):
+    """返回 [start, end) 内全部最大连续空闲区间，按开始时间升序。
+
+    只统计同一资源的未取消预约；跨边界预约只按相交部分裁剪。
+    左闭右开：端点相接不算占用，相邻空闲段之间必有占用时段。
+    每项只含 start 与 end（完整日期时间文本），只保留非空区间；
+    无占用时返回整个窗口，完全占满时返回空列表。
+    时间为定宽文本，字典序即时间先后。只读查询，不写入任何记录。
+    """
+    rows = conn.execute(
+        """
+        SELECT start, end FROM bookings
+        WHERE resource_id = ? AND cancelled = 0
+          AND start < ? AND end > ?
+        ORDER BY start ASC, id ASC
+        """,
+        (resource_id, end, start),
+    ).fetchall()
+    free = []
+    cursor = start
+    for booking_start, booking_end in rows:
+        # 裁剪到查询窗口内；与已扫描部分重叠的预约只推进 cursor。
+        occ_start = max(booking_start, start)
+        occ_end = min(booking_end, end)
+        if occ_start > cursor:
+            free.append({"start": cursor, "end": occ_start})
+        if occ_end > cursor:
+            cursor = occ_end
+    if cursor < end:
+        free.append({"start": cursor, "end": end})
+    return free
+
+
 def insert_booking(conn, resource_id, start, end):
     """在事务内依次检查资源存在与时段冲突，返回 booking_id。
 

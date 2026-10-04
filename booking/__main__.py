@@ -122,6 +122,11 @@ def build_parser():
     p_day_query.add_argument("--resource", required=True)
     p_day_query.add_argument("--date", required=True)
 
+    p_free_query = subparsers.add_parser("free-query")
+    p_free_query.add_argument("--resource", required=True)
+    p_free_query.add_argument("--start", required=True)
+    p_free_query.add_argument("--end", required=True)
+
     return parser
 
 
@@ -156,6 +161,13 @@ def main(argv):
             except OverflowError:
                 # 9999-12-31 之后没有可表示的次日，查询上界不设限。
                 day_end = None
+        elif args.command == "free-query":
+            resource_id = parse_positive_int(args.resource)
+            start_dt = parse_time(args.start)
+            end_dt = parse_time(args.end)
+            if not start_dt < end_dt:
+                raise UsageError("start must be strictly before end")
+            start, end = args.start, args.end
         else:  # pragma: no cover - argparse 已保证
             raise UsageError("unknown command")
     except UsageError:
@@ -169,7 +181,7 @@ def main(argv):
         # SQLite（否则会抛 OverflowError）。此时连接已正常打开，因此合法输入
         # 原有的建库初始化与旧库兼容行为保持不变；invalid_input 已在连接前
         # 返回，优先级不受影响。
-        if args.command in ("reserve", "day-query"):
+        if args.command in ("reserve", "day-query", "free-query"):
             if resource_id is OVERSIZED_ID:
                 return _emit({"error": "resource_not_found"}, 2)
         elif args.command == "cancel":
@@ -201,6 +213,20 @@ def main(argv):
                     "resource_id": resource_id,
                     "date": args.date,
                     "bookings": bookings,
+                },
+                0,
+            )
+
+        if args.command == "free-query":
+            if not store.resource_exists(conn, resource_id):
+                return _emit({"error": "resource_not_found"}, 2)
+            free_slots = store.query_free_slots(conn, resource_id, start, end)
+            return _emit(
+                {
+                    "resource_id": resource_id,
+                    "start": start,
+                    "end": end,
+                    "free_slots": free_slots,
                 },
                 0,
             )
