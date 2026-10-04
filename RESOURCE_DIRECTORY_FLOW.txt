@@ -1,0 +1,357 @@
+================================================================================
+resource-list 资源目录查询流程说明
+================================================================================
+
+本文描述一次资源目录查询（resource-list，含可选的 --contains 名称片段
+筛选）从命令行输入到 JSON 输出的完整流程，全部结论均可对照源码核实。
+涉及文件只有两个：
+
+  booking/__main__.py   命令行入口、参数解析与校验、错误输出
+  booking/store.py      SQLite 持久化层、目录读取与片段筛选
+
+本文只描述既有行为，不改动任何产品代码、公开命令、输出协议、既有测试、
+README 或数据库格式；其他入口（resource-add、reserve、cancel、
+reschedule、day-query、free-query）的行为均不在本文范围，保持不变。
+
+--------------------------------------------------------------------------------
+1. 总体流程概览
+--------------------------------------------------------------------------------
+
+一次 resource-list 依次经过四个阶段，顺序固定：
+
+  (1) 参数解析与输入校验   booking/__main__.py: main() 前半段
+                           （resource-list 分支）
+  (2) 打开数据库           booking/store.py: connect()
+  (3) 目录读取与片段筛选   booking/store.py: list_resources()
+  (4) 结果输出             booking/__main__.py: main() 的 resource-list 分支
+                           经由 _emit()
+
+关键次序：阶段 (1) 的任何失败都在阶段 (2) 之前返回，因此非法输入不会创建
+数据库文件、不会迁移旧库、不会改动任何记录。这一点由 main() 的结构保证
+——全部校验放在 try 块内、connect 之前（booking/__main__.py:262-323）：
+
+    # 先解析参数并完成全部输入校验，之后才连接/初始化数据库，
+    # 保证非法输入不会新建文件或改动任何记录。
+    try:
+        args = parser.parse_args(argv)
+        ...
+    except UsageError:
+        return invalid_input()
+
+    # 输入合法后再打开数据库（不存在则初始化），后续进程沿用同一文件。
+    conn = store.connect(args.db)
+
+--------------------------------------------------------------------------------
+2. 阶段一：参数解析与输入校验
+--------------------------------------------------------------------------------
+
+2.1 命令行形状
+
+resource-list 只接受一个可选参数（booking/__main__.py:238-240）：
+
+    p_list = subparsers.add_parser("resource-list")
+    # 可选：只返回保存后的名称包含该片段的资源；缺省返回完整目录。
+    p_list.add_argument("--contains", default=None)
+
+  - --db 为全局必填参数（booking/__main__.py:215），值为 SQLite 文件路径。
+  - --contains 省略时 argparse 给出默认值 None，表示“不筛选，返回完整
+    目录”；注意 None 与“给出了空文本”是两种不同情况（见 2.3）。
+  - argparse 本身的报错（缺少 --db、未知子命令、未知参数、--contains
+    缺值等）被自定义解析器 _Parser.error 转成 UsageError
+    （booking/__main__.py:56-60），与值校验失败走同一路径，因此 argparse
+    不会自己向 stderr 输出用法文本。
+
+2.2 片段的规范化：去首尾空白、保留中间空格
+
+main() 的 resource-list 分支（booking/__main__.py:290-297）：
+
+    elif args.command == "resource-list":
+        # --contains 去除首尾空白后参与匹配（中间空格保留）；
+        # 缺省为 None 表示不筛选，空文本或纯空白一律非法。
+        contains = None
+        if args.contains is not None:
+            contains = args.contains.strip()
+            if not contains:
+                raise UsageError("contains must not be empty")
+
+  - 省略 --contains：args.contains 为 None，局部变量 contains 保持 None，
+    阶段三不做任何筛选，返回完整目录。
+  - 给出 --contains：对入参文本调用 str.strip()。它去除字符串首尾的全部
+    空白（空格、制表符 \t、换行等），中间的空格原样保留。例如
+    "  会议室  " 规范化为 "会议室"，"一号 会议室" 中的中间空格不受影响。
+  - strip 后为空字符串（即原始值为空文本或纯空白）时抛 UsageError。
+  - 片段的规范化只作用于“片段本身”。被匹配的对象是资源登记时保存后的
+    名称：resource-add 也在入库前对名称做一次 strip
+    （booking/__main__.py:266-269，name = args.name.strip()），首尾空白
+    不入库、中间空格保留。因此匹配双方各自的首尾空白都已去除，中间空格
+    都是名称的真实组成部分。
+
+2.3 校验失败的统一出口
+
+下列情况全部抛 UsageError 并被同一处捕获（booking/__main__.py:319-320）：
+
+  - --contains 缺少值（如末尾只写 --contains）：argparse 报错，经
+    _Parser.error 转为 UsageError；
+  - --contains 传入空文本（--contains ""）；
+  - --contains 仅含空白（--contains "   "、--contains " \t "），strip 后
+    为空；
+  - 出现 resource-list 不支持的参数（如 --name、--bogus），或缺少必填的
+    --db：argparse 拒绝。
+
+invalid_input()（booking/__main__.py:68-69）向标准输出打印且只打印一个
+JSON 对象：
+
+    {"error": "invalid_input"}
+
+退出码为 2，标准错误为空（stderr 没有任何文本，也没有异常堆栈）。以上
+各类情况不区分错误文案，输出完全相同；且都在 store.connect 之前返回：
+不创建数据库文件、不触发旧库迁移、不触碰任何数据（见第 3 节）。
+
+--------------------------------------------------------------------------------
+3. 阶段二：打开数据库 store.connect（booking/store.py:22-39）
+--------------------------------------------------------------------------------
+
+只有输入全部合法后才调用 store.connect(args.db)：
+
+  - 文件不存在时，sqlite3.connect 创建该文件，并执行 SCHEMA
+    （booking/store.py:6-19，CREATE TABLE IF NOT EXISTS resources /
+    bookings）。因此对一个不存在的路径执行合法的 resource-list（无论是否
+    带 --contains），返回空目录的同时会在磁盘上留下初始化后的数据库文件。
+  - 对取消功能上线前创建的旧库，connect 会用 PRAGMA table_info(bookings)
+    检查列；若缺少 cancelled 列，则 ALTER TABLE 补齐，已有预约一律视为
+    未取消（默认值 0），不重建数据（booking/store.py:34-38）。这条迁移
+    是所有命令共用的连接逻辑，resource-list 打开旧库时同样沿用。
+  - 连接置于 autocommit 模式并启用外键。
+
+“只读”的准确含义需要区分两类写：
+
+  - 业务数据层面，resource-list 确实只读：list_resources 只执行一条
+    SELECT（见第 4 节），不开始事务、不 INSERT/UPDATE/DELETE，不新增或
+    删除资源与预约，也不消耗 AUTOINCREMENT 标识（查询后再登记资源，新
+    标识仍紧接原有最大标识）。
+  - 文件层面，打开数据库这一步本身可能写文件：不存在的路径会被初始化，
+    缺少 cancelled 列的旧库会被补齐。因此不能把“查询只读”解释成“绝不
+    写文件”；准确的承诺是“合法查询不改变业务记录，但沿用既有的建库与
+    旧库迁移行为”。
+
+--------------------------------------------------------------------------------
+4. 阶段三：目录读取与片段筛选 list_resources（booking/store.py:55-73）
+--------------------------------------------------------------------------------
+
+4.1 读取与排序
+
+    rows = conn.execute(
+        "SELECT id, name FROM resources ORDER BY id ASC"
+    ).fetchall()
+
+  - 一次取出 resources 表的全部行，只取 id 与 name 两列；预约表不参与。
+  - id 是 INTEGER PRIMARY KEY AUTOINCREMENT（SCHEMA，store.py:7-10），
+    ORDER BY id ASC 按数值升序：标识 2 排在 10 之前，而不是按文本
+    "1","10","2" 排列。
+  - SQL 不做任何去重：同名资源各自是独立的一行，结果中分别保留。
+  - 排序只按标识，不按名称；名称直接取保存值，不做任何加工。
+
+4.2 片段匹配：Python 侧区分大小写的连续子串判断
+
+    return [
+        {"resource_id": row[0], "name": row[1]}
+        for row in rows
+        if contains is None or contains in row[1]
+    ]
+
+  - contains 为 None（省略 --contains）时谓词恒真，全部行原样进入结果，
+    即完整目录。
+  - contains 非 None 时使用 Python 的 in 做字符串连续子串判断，被匹配的
+    是数据库中保存后的名称 row[1]：
+      * 区分大小写："Room" 命中 "Room A"，"room"、"ROOM" 不命中；不做
+        大小写归一化。
+      * 必须是连续子串：名称 "一号 会议室"（中间有空格）能被 "一号 会议"
+        命中，但不能被跳过空格的 "一号会议室" 命中。
+      * 百分号 % 与下划线 _ 一律按普通字符处理。因为筛选在 Python 侧用
+        in 完成，而不是 SQL LIKE，机制上就不存在通配符："%" 只命中名称
+        里真的含有 "%" 字符的资源，"_" 只命中真的含 "_" 的资源，
+        "投影_" 不会像 LIKE 那样命中 "投影仪"。
+      * 不做正则解释，也不做任何字符归一化（全角/半角标点、各语种数字
+        都按原字符比较，如 "（小）" 与 "(小)" 互不命中）。
+  - 筛选只决定每行“保留或丢弃”，不改变行的顺序（仍按标识数值升序）、
+    不改变名称文本，也不会把多行合并。
+  - 没有任何一行满足时，返回空列表 []，这属于成功结果。
+
+--------------------------------------------------------------------------------
+5. 阶段四：结果输出
+--------------------------------------------------------------------------------
+
+main() 对 resource-list 的处理只有一行分发（booking/__main__.py:343-344）：
+
+    if args.command == "resource-list":
+        return _emit({"resources": store.list_resources(conn, contains)}, 0)
+
+_emit()（booking/__main__.py:63-65）用 json.dumps(..., ensure_ascii=False)
+向标准输出打印恰好一个 JSON 对象并返回退出码。成功时：
+
+  - 退出码 0，标准错误为空；
+  - 顶层只有一个键 resources，值为数组；
+  - 数组每项只有两个键：resource_id（整数）与 name（字符串，保存值
+    原样返回）；
+  - 按 resource_id 数值升序；同名资源分别保留为独立的项；
+  - 无命中（或目录本身为空）时 resources 是空数组 []，仍是退出码 0。
+
+连接在 finally 中关闭（booking/__main__.py:438-439），与业务结果无关。
+
+--------------------------------------------------------------------------------
+6. 完整示例（从全新 demo.sqlite 开始）
+--------------------------------------------------------------------------------
+
+以下命令在全新环境可完整复现：不含 demo.sqlite 的目录中，依次执行三条
+resource-add 准备数据，再执行两次 resource-list。命令通过公开入口
+python -m booking 调用；每条命令是独立进程。
+
+6.1 准备数据：登记三个资源
+
+    python -m booking --db demo.sqlite resource-add --name "  一号会议室  "
+    预期标准输出（退出码 0，标准错误为空）：
+    {"resource_id": 1, "name": "一号会议室"}
+
+    python -m booking --db demo.sqlite resource-add --name "投影_仪"
+    预期标准输出（退出码 0，标准错误为空）：
+    {"resource_id": 2, "name": "投影_仪"}
+
+    python -m booking --db demo.sqlite resource-add --name "一号会议室"
+    预期标准输出（退出码 0，标准错误为空）：
+    {"resource_id": 3, "name": "一号会议室"}
+
+说明：
+  - 全新库首批标识按 AUTOINCREMENT 依次为 1、2、3。
+  - 第一条名称首尾的两个空格在 resource-add 入库前被 strip
+    （booking/__main__.py:266-269），保存值与回显均为“一号会议室”；
+    第二条中的下划线是名称中间的普通字符，原样保存为“投影_仪”；
+    第三条保存为“一号会议室”，与第一条同名但取得独立标识 3，不去重。
+  - 因而库中保存后的名称依次是：1=“一号会议室”、2=“投影_仪”、
+    3=“一号会议室”。
+
+6.2 查询一：片段带首尾空白，命中两个同名资源
+
+    python -m booking --db demo.sqlite resource-list --contains "  会议室  "
+
+预期标准输出（退出码 0，标准错误为空）：
+
+    {"resources": [{"resource_id": 1, "name": "一号会议室"}, {"resource_id": 3, "name": "一号会议室"}]}
+
+筛选过程：
+  - 片段 "  会议室  " 经 strip 规范化为 "会议室"（首尾空白去除；本例片段
+    没有中间空格）。
+  - 资源 1 的保存名称“一号会议室”包含连续子串“会议室”，命中；资源 3
+    同名，同样命中；资源 2“投影_仪”不含该子串，被丢弃。
+  - 两个同名资源分别保留：筛选不做合并，1 和 3 各自成为一项，这是
+    resources 表中本就独立的两行；顺序按标识数值升序，故 1 在 3 之前；
+    name 取保存值原样返回，两条都是“一号会议室”。
+  - 省略 --contains 时则三项全部返回（1、2、3），即完整目录。
+
+6.3 查询二：百分号按普通字符处理，无命中
+
+    python -m booking --db demo.sqlite resource-list --contains "%"
+
+预期标准输出（退出码 0，标准错误为空）：
+
+    {"resources": []}
+
+筛选过程：
+  - "%" 没有首尾空白，strip 后仍是 "%"。
+  - 匹配使用 Python 的 in 而非 SQL LIKE，"%" 是要求名称中含有字面百分号
+    字符的连续子串，不是“任意序列”通配符。三个保存名称“一号会议室”、
+    “投影_仪”、“一号会议室”都不含 "%"，故全部不命中。
+  - 特别地，资源 2 名称中的下划线也只是普通字符：它含 "_" 而不含 "%"，
+    不会被 "%" 命中；反过来用 --contains "_" 或 --contains "投影_" 时，
+    只有资源 2 命中，且 "投影_" 不会通配命中不含下划线的“投影仪”。
+  - 无命中是成功结果：空数组、退出码 0、标准错误为空。
+
+--------------------------------------------------------------------------------
+7. 可核对的现有测试
+--------------------------------------------------------------------------------
+
+下列用例均通过公开命令行入口 python -m booking 断言（JSON 内容、退出码
+与 stderr），可用 python3 -m unittest <模块> -v 复跑：
+
+test_resource_list.py（完整目录查询的既有行为）：
+  - ResourceListTestCase.test_missing_path_initializes_database_and_returns_empty_list
+    路径不存在时合法查询即创建数据库文件并返回 []，且不消耗标识（随后
+    首个资源标识仍为 1）——对应本文第 3 节“打开即初始化”与只读语义。
+  - test_sorted_by_numeric_id_not_name_and_same_names_not_merged
+    按标识数值升序、不按名称排序、同名项不合并、名称按保存值返回。
+  - test_ordering_is_numeric_across_9_and_10_not_textual
+    标识 1..10 按数值而非文本顺序排列（对应本文 4.1）。
+  - test_repeated_queries_and_reopen_are_identical
+    重复查询与独立进程重开同一数据库后结果一致。
+  - test_queries_do_not_consume_ids_or_change_records
+    查询不增删业务记录、不消耗资源与预约标识，取消预约也不影响目录。
+  - test_unsupported_name_argument_returns_invalid_input
+    resource-list 携带不支持的 --name：{"error":"invalid_input"}、退出码
+    2、stderr 为空。
+  - test_invalid_input_does_not_create_database_file
+    非法参数指向不存在的路径时文件不被创建（对应本文 2.3 与第 3 节）。
+  - test_invalid_input_does_not_change_existing_database
+    已有库上非法参数失败后，目录与预约查询结果不变。
+
+test_resource_list_contains.py（--contains 筛选的既有行为）：
+  - test_contains_filters_by_name_fragment
+    片段只返回名称包含它的资源，按标识升序，同名两项分别返回。
+  - test_contains_fragment_is_stripped_before_matching
+    片段去首尾空白后与不带空白时结果相同（本文示例 6.2 的同类断言）。
+  - test_contains_no_match_returns_empty_list
+    无命中返回 [] 且退出码 0。
+  - test_contains_omitted_keeps_full_listing
+    省略 --contains 返回完整目录。
+  - test_contains_matches_saved_name_verbatim
+    按保存后的名称匹配：入库时首尾空白已去除、中间空格保留；跳过中间
+    空格的片段不命中。
+  - test_contains_is_case_sensitive
+    区分大小写。
+  - test_contains_percent_and_underscore_are_literal
+    百分号与下划线按普通字符匹配，不作为通配符（本文示例 6.3 的同类
+    断言）。
+  - test_contains_matches_digits_and_punctuation_verbatim
+    数字与标点按原字符匹配，无字符归一化。
+  - test_contains_on_missing_database_returns_empty_list
+    带 --contains 的合法查询在不存在的库上返回 []、创建文件且不消耗标识。
+  - test_contains_query_is_read_only
+    筛选查询不增改删记录、不消耗资源标识。
+  - test_contains_repeated_queries_and_reopen_are_identical
+    重复筛选查询与重开后结果一致。
+  - test_contains_missing_value_returns_invalid_input
+    --contains 缺值：invalid_input、退出码 2、stderr 为空。
+  - test_contains_empty_text_returns_invalid_input
+    --contains 空文本：invalid_input。
+  - test_contains_whitespace_only_returns_invalid_input
+    --contains 纯空白（"   "、" \t "）：invalid_input。
+  - test_invalid_contains_does_not_create_database_file
+    非法 --contains 指向不存在的路径时不创建文件。
+  - test_invalid_contains_does_not_change_existing_database
+    已有库上非法 --contains 失败后目录不变。
+
+旧库迁移（connect 的共用行为，本文第 3 节）：
+  - test_legacy_db_compat.py 固定“缺少 cancelled 列的旧库首次打开即自动
+    补齐、已有数据保持有效且不被改写”的承诺；该迁移位于所有命令共用的
+    store.connect（booking/store.py:34-38），这些用例经由同一连接路径上
+    的 day-query/cancel 观察它，resource-list 打开旧库时执行的是同一段
+    代码。
+
+--------------------------------------------------------------------------------
+8. 行为要点汇总
+--------------------------------------------------------------------------------
+
+  - 省略 --contains 返回完整目录；给出片段时先 strip 首尾空白（中间空格
+    保留），再对保存后的名称做区分大小写的连续子串匹配；% 与 _ 按普通
+    字符处理（Python in，不是 SQL LIKE），无正则、无字符归一化。
+  - 结果按资源标识数值升序（2 在 10 前），同名资源分别保留，名称按保存
+    值原样返回；每项只含 resource_id 与 name。
+  - 成功输出单个 JSON 对象 {"resources": [...]}，无命中时为空数组，
+    退出码 0，标准错误为空。
+  - --contains 缺值、空文本、纯空白，或出现不支持的参数：统一输出
+    {"error": "invalid_input"}，退出码 2，标准错误为空；这些输入在打开
+    数据库之前被拒绝——不创建文件、不迁移旧库、不改变任何数据。
+  - 合法查询不增删业务记录、不消耗 AUTOINCREMENT 标识；但打开不存在的
+    数据库会初始化文件，打开缺少 cancelled 列的旧库会沿用既有迁移补齐
+    该列。“查询只读”指业务数据只读，不能理解为绝不写文件。
+  - 其他入口（resource-add、reserve、cancel、reschedule、day-query、
+    free-query）的既有行为不在本文范围，保持不变。
+================================================================================
