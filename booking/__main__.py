@@ -225,7 +225,9 @@ def build_parser():
     p_cancel = subparsers.add_parser("cancel")
     p_cancel.add_argument("--booking", required=True)
 
-    subparsers.add_parser("resource-list")
+    p_list = subparsers.add_parser("resource-list")
+    # 可选：只返回保存后的名称包含该片段的资源；缺省返回完整目录。
+    p_list.add_argument("--contains", default=None)
 
     p_day_query = subparsers.add_parser("day-query")
     p_day_query.add_argument("--resource", required=True)
@@ -265,7 +267,14 @@ def main(argv):
         elif args.command == "cancel":
             booking_id = parse_positive_int(args.booking)
         elif args.command == "resource-list":
-            pass  # 无额外参数，无需校验
+            # --contains 缺省为完整目录；给出时去除首尾空白（中间空格保留），
+            # 结果为空文本（含仅空白）按非法输入处理。匹配本身是区分大小写
+            # 的连续子串比较，在存储层完成，此处在连接数据库前只做文本校验。
+            contains = None
+            if args.contains is not None:
+                contains = args.contains.strip()
+                if not contains:
+                    raise UsageError("contains must not be empty")
         elif args.command == "day-query":
             resource_id = parse_positive_int(args.resource)
             day = parse_date(args.date)
@@ -309,7 +318,7 @@ def main(argv):
             )
 
         if args.command == "resource-list":
-            return _emit({"resources": store.list_resources(conn)}, 0)
+            return _emit({"resources": store.list_resources(conn, contains)}, 0)
 
         if args.command == "cancel":
             if not store.cancel_booking(conn, booking_id):
