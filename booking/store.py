@@ -196,6 +196,46 @@ def _minutes_between(start, end):
     return delta.days * 1440 + delta.seconds // 60
 
 
+def insert_bookings(conn, resource_id, intervals):
+    """在单个事务内为同一资源创建多条预约：全部成功或全部失败。
+
+    intervals 为按发生时间升序的 (start, end) 定宽文本对。依次检查资源
+    存在、生成区间彼此不重叠（左闭右开，端点相接不冲突）以及与同资源
+    未取消预约不冲突；任一检查失败即回滚，不新增记录、不消耗预约标识。
+    成功返回 (booking_ids, None)，标识与 intervals 按顺序一一对应，各项
+    独立分配且不复用；资源不存在返回 (None, "resource_not_found")，
+    冲突返回 (None, "booking_conflict")。各条预约持久化为普通预约，
+    不记录任何组标识。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not resource_exists(conn, resource_id):
+            conn.rollback()
+            return None, "resource_not_found"
+        previous_end = None
+        for start, end in intervals:
+            # 区间按开始时间升序：彼此重叠当且仅当相邻两项相交。
+            if previous_end is not None and previous_end > start:
+                conn.rollback()
+                return None, "booking_conflict"
+            if has_conflict(conn, resource_id, start, end):
+                conn.rollback()
+                return None, "booking_conflict"
+            previous_end = end
+        booking_ids = []
+        for start, end in intervals:
+            cur = conn.execute(
+                "INSERT INTO bookings (resource_id, start, end) VALUES (?, ?, ?)",
+                (resource_id, start, end),
+            )
+            booking_ids.append(cur.lastrowid)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return booking_ids, None
+
+
 def insert_booking(conn, resource_id, start, end):
     """在事务内依次检查资源存在与时段冲突，返回 booking_id。
 
