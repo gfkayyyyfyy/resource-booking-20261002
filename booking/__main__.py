@@ -24,6 +24,12 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # 会让 "1\n" 被当成 1、"0\n" 进入纯零分支后触发未捕获的 ValueError。
 # \Z 不接受任何尾随字符，首尾空白、制表符、CR 或夹在数字中间的 LF 一律拒绝。
 POSITIVE_INT_RE = re.compile(r"^\d+\Z")
+# --min-minutes 只接受 ASCII 数字文本（\d 会匹配各语种十进制数字，
+# 这里必须用 [0-9]）；同样用 \Z 锚定绝对结尾，拒绝任何首尾/夹带空白。
+MIN_MINUTES_RE = re.compile(r"^[0-9]+\Z")
+# --min-minutes 的取值上限：一天 24 小时的分钟数。
+MAX_MIN_MINUTES = 1440
+_MAX_MIN_MINUTES_DIGITS = str(MAX_MIN_MINUTES)
 # SQLite INTEGER 主键可表示的最大有符号整数；任何真实存在的资源/预约
 # 标识都不可能超过它，因此更大的正整数一律等价于“标识不存在”。
 SQLITE_MAX_ID = 2 ** 63 - 1
@@ -79,6 +85,27 @@ def parse_positive_int(text):
     return value
 
 
+def parse_min_minutes(text):
+    """解析 --min-minutes：1 至 1440 的十进制整数文本，允许前导零。
+
+    只接受 ASCII 数字；空文本、纯零、负数、小数、超出范围或含空白等
+    其他字符一律视为非法输入。先剥前导零再按位数判断，不把超长数字串
+    直接交给 int()（Python 对超长数字串的转换有位数限制）。
+    """
+    if text is None or not MIN_MINUTES_RE.match(text):
+        raise UsageError("expected integer minutes in [1, 1440]")
+    stripped = text.lstrip("0")
+    if not stripped:  # 纯零（含 "0"、"000"）不在 [1, 1440] 内。
+        raise UsageError("expected integer minutes in [1, 1440]")
+    if len(stripped) > len(_MAX_MIN_MINUTES_DIGITS):
+        raise UsageError("expected integer minutes in [1, 1440]")
+    # 剩余至多 4 位，int() 转换不受超长数字串限制。
+    value = int(stripped)
+    if not 1 <= value <= MAX_MIN_MINUTES:
+        raise UsageError("expected integer minutes in [1, 1440]")
+    return value
+
+
 def parse_time(text):
     """严格解析 YYYY-MM-DDTHH:mm，返回带 UTC+08:00 时区的 datetime。"""
     if text is None or not TIME_RE.match(text):
@@ -126,6 +153,8 @@ def build_parser():
     p_free_query.add_argument("--resource", required=True)
     p_free_query.add_argument("--start", required=True)
     p_free_query.add_argument("--end", required=True)
+    # 可选：只保留窗口内连续分钟数不低于该值的空闲区间；缺省不过滤。
+    p_free_query.add_argument("--min-minutes", default=None)
 
     return parser
 
@@ -167,6 +196,9 @@ def main(argv):
             end_dt = parse_time(args.end)
             if not start_dt < end_dt:
                 raise UsageError("start must be strictly before end")
+            min_minutes = None
+            if args.min_minutes is not None:
+                min_minutes = parse_min_minutes(args.min_minutes)
             start, end = args.start, args.end
         else:  # pragma: no cover - argparse 已保证
             raise UsageError("unknown command")
@@ -221,7 +253,7 @@ def main(argv):
             if not store.resource_exists(conn, resource_id):
                 return _emit({"error": "resource_not_found"}, 2)
             free_slots = store.query_free_slots(
-                conn, resource_id, start, end
+                conn, resource_id, start, end, min_minutes
             )
             return _emit(
                 {

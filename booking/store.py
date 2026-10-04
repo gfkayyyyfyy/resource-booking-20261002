@@ -1,5 +1,6 @@
 """共享资源预约台：SQLite 持久化层。"""
 
+import datetime
 import sqlite3
 
 SCHEMA = """
@@ -140,12 +141,14 @@ def query_day_bookings(conn, resource_id, day_start, day_end):
     ]
 
 
-def query_free_slots(conn, resource_id, start, end):
+def query_free_slots(conn, resource_id, start, end, min_minutes=None):
     """返回 [start, end) 内全部最大连续空闲区间，按开始时间升序。
 
     只统计同一资源的未取消预约；跨出窗口的预约只按相交部分截断。
     左闭右开：端点相接不算重叠。结果只含非空区间，相邻两项之间必有
     占用时段。每项只含 start 与 end（完整日期时间文本）。
+    min_minutes 不为 None 时，只保留窗口内连续分钟数不低于该值的区间；
+    合格区间保留完整起止端点，不截成指定长度、不拆分、不跨占用拼接。
     只读查询，不写入任何记录。
     """
     rows = conn.execute(
@@ -169,7 +172,28 @@ def query_free_slots(conn, resource_id, start, end):
             cursor = busy_end
     if cursor < end:
         free_slots.append({"start": cursor, "end": end})
+    if min_minutes is not None:
+        # 区间已按窗口截断，其完整时长即窗口内的连续分钟数。
+        free_slots = [
+            slot
+            for slot in free_slots
+            if _minutes_between(slot["start"], slot["end"]) >= min_minutes
+        ]
     return free_slots
+
+
+def _minutes_between(start, end):
+    """两个 YYYY-MM-DDTHH:mm 文本之间经过的分钟数。
+
+    按完整日期时间求差，跨午夜区间经过的分钟数自然计入；
+    输入为分钟精度，结果必为整数分钟。
+    """
+    time_format = "%Y-%m-%dT%H:%M"
+    delta = (
+        datetime.datetime.strptime(end, time_format)
+        - datetime.datetime.strptime(start, time_format)
+    )
+    return delta.days * 1440 + delta.seconds // 60
 
 
 def insert_booking(conn, resource_id, start, end):
