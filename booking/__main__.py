@@ -242,6 +242,9 @@ def build_parser():
     p_free_query.add_argument("--end", required=True)
     # 可选：只保留窗口内连续分钟数不低于该值的空闲区间；缺省不过滤。
     p_free_query.add_argument("--min-minutes", default=None)
+    # 可选无值开关：只返回窗口内最早满足条件的空闲区间（至多一项）；
+    # 缺省返回全部最大连续空闲区间。
+    p_free_query.add_argument("--first-only", action="store_true")
 
     return parser
 
@@ -346,7 +349,8 @@ def main(argv):
             if not store.resource_exists(conn, resource_id):
                 return _emit({"error": "resource_not_found"}, 2)
             free_slots = store.query_free_slots(
-                conn, resource_id, start, end, min_minutes
+                conn, resource_id, start, end, min_minutes,
+                first_only=args.first_only,
             )
             return _emit(
                 {
