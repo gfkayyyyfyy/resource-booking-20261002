@@ -80,16 +80,38 @@ def resource_exists(conn, resource_id):
     return row is not None
 
 
-def has_conflict(conn, resource_id, start, end):
-    """同一资源上是否存在与 [start, end) 相交的未取消预约（左闭右开）。"""
+def has_conflict(conn, resource_id, start, end, exclude_booking_id=None):
+    """同一资源上是否存在与 [start, end) 相交的未取消预约（左闭右开）。
+
+    创建（单次与每周重复）与改期共同的时段冲突规则只在此维护：
+    只统计同一资源（resource_id 相同）且未取消（cancelled = 0）的预约，
+    已取消预约与其他资源的预约不阻挡；相交判定 start < end AND
+    end > start 是左闭右开 [start, end) 语义，端点相接不算重叠，
+    部分重叠、完全相同与包含关系均冲突。
+
+    exclude_booking_id 为 None（创建）时检查全部已有占用；不为 None
+    （改期）时在同一条规则上额外排除该标识的预约——即目标预约自身，
+    因此新旧时段重叠乃至时段完全不变都允许成功，但其他预约照常阻挡。
+    该参数只取存储层自己的内部标识，不接受外部文本，拼入的 SQL
+    片段是固定常量。
+    """
+    # 排除条件是二选一的固定 SQL 常量，不含任何外部输入；
+    # 相交谓词本身在全文只出现这一次，两条路径共用。
+    exclude_clause = "AND id != ?" if exclude_booking_id is not None else ""
+    parameters = (
+        (exclude_booking_id, resource_id, end, start)
+        if exclude_booking_id is not None
+        else (resource_id, end, start)
+    )
     row = conn.execute(
-        """
+        f"""
         SELECT 1 FROM bookings
         WHERE resource_id = ? AND cancelled = 0
+          {exclude_clause}
           AND start < ? AND end > ?
         LIMIT 1
         """,
-        (resource_id, end, start),
+        parameters,
     ).fetchone()
     return row is not None
 
@@ -123,12 +145,14 @@ def reschedule_booking(conn, booking_id, start, end):
     (None, "booking_not_found")；新时段与同资源“其他”未取消预约相交
     （左闭右开）返回 (None, "booking_conflict")。
 
-    冲突比较显式排除目标行（id != booking_id）：目标预约自身不阻挡
-    改期，因此新旧时段重叠乃至时段完全不变都允许成功；端点相接同样
-    不冲突。任一检查失败即回滚，旧时段、取消状态与其他记录全部保持
-    不变，不会出现只释放旧时段的中间结果。成功时只更新该行的起止
-    文本：不新增预约、不消耗标识、不改资源归属与其他任何记录。
-    每周重复预约在库中各自独立，本函数只改指定的一行。
+    冲突规则与创建共用 has_conflict：相交谓词、同资源与未取消条件
+    都只在那一处维护，本函数只通过 exclude_booking_id 传入目标标识，
+    显式排除目标行。目标预约自身不阻挡改期，因此新旧时段重叠乃至
+    时段完全不变都允许成功；端点相接同样不冲突。任一检查失败即回滚，
+    旧时段、取消状态与其他记录全部保持不变，不会出现只释放旧时段的
+    中间结果。成功时只更新该行的起止文本：不新增预约、不消耗标识、
+    不改资源归属与其他任何记录。每周重复预约在库中各自独立，
+    本函数只改指定的一行。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -141,16 +165,9 @@ def reschedule_booking(conn, booking_id, start, end):
             conn.rollback()
             return None, "booking_not_found"
         resource_id = row[0]
-        clash = conn.execute(
-            """
-            SELECT 1 FROM bookings
-            WHERE id != ? AND resource_id = ? AND cancelled = 0
-              AND start < ? AND end > ?
-            LIMIT 1
-            """,
-            (booking_id, resource_id, end, start),
-        ).fetchone()
-        if clash is not None:
+        if has_conflict(
+            conn, resource_id, start, end, exclude_booking_id=booking_id
+        ):
             conn.rollback()
             return None, "booking_conflict"
         conn.execute(
