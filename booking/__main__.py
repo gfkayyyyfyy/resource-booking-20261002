@@ -117,6 +117,23 @@ def parse_time(text):
     return parsed.replace(tzinfo=TIMEZONE_OFFSET)
 
 
+def parse_time_window(start_text, end_text):
+    """校验 reserve/free-query 共用的时间窗口规则，返回原始 (start, end) 文本。
+
+    两个入口共同的时间窗口规则只在此维护：先后严格解析开始与结束文本
+    （固定 UTC+08:00、零填充 YYYY-MM-DDTHH:mm，拒绝秒、时区后缀与首尾
+    空白，非法日期由 parse_time 拒绝），并要求开始严格早于结束；起止
+    相等或颠倒都抛 UsageError。过去日期与跨午夜窗口不在此限制，继续
+    合法。成功时返回入参原文：成功结果顶层原样回显，定宽文本也直接
+    交给存储层（字典序即时间先后）。
+    """
+    start_dt = parse_time(start_text)
+    end_dt = parse_time(end_text)
+    if not start_dt < end_dt:
+        raise UsageError("start must be strictly before end")
+    return start_text, end_text
+
+
 def parse_date(text):
     """严格解析零填充 YYYY-MM-DD，返回带 UTC+08:00 时区的 date。"""
     if text is None or not DATE_RE.match(text):
@@ -171,11 +188,7 @@ def main(argv):
                 raise UsageError("name must not be empty")
         elif args.command == "reserve":
             resource_id = parse_positive_int(args.resource)
-            start_dt = parse_time(args.start)
-            end_dt = parse_time(args.end)
-            if not start_dt < end_dt:
-                raise UsageError("start must be strictly before end")
-            start, end = args.start, args.end
+            start, end = parse_time_window(args.start, args.end)
         elif args.command == "cancel":
             booking_id = parse_positive_int(args.booking)
         elif args.command == "resource-list":
@@ -192,14 +205,10 @@ def main(argv):
                 day_end = None
         elif args.command == "free-query":
             resource_id = parse_positive_int(args.resource)
-            start_dt = parse_time(args.start)
-            end_dt = parse_time(args.end)
-            if not start_dt < end_dt:
-                raise UsageError("start must be strictly before end")
+            start, end = parse_time_window(args.start, args.end)
             min_minutes = None
             if args.min_minutes is not None:
                 min_minutes = parse_min_minutes(args.min_minutes)
-            start, end = args.start, args.end
         else:  # pragma: no cover - argparse 已保证
             raise UsageError("unknown command")
     except UsageError:
