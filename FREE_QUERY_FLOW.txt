@@ -1,0 +1,297 @@
+================================================================================
+free-query 空闲时段查询流程说明
+================================================================================
+
+本文独立描述一次空闲时段查询（free-query）从命令行输入到 JSON 输出的完整
+流程，全部结论均可对照源码核实。涉及文件只有两个：
+
+  booking/__main__.py   命令行入口、参数解析与校验、错误输出
+  booking/store.py      SQLite 持久化层、空闲区间计算
+
+本文只描述既有行为，不改动任何产品代码、公开接口或数据库格式。
+
+--------------------------------------------------------------------------------
+1. 总体流程概览
+--------------------------------------------------------------------------------
+
+一次 free-query 依次经过四个阶段，顺序固定：
+
+  (1) 参数解析与输入校验   booking/__main__.py: main() 前半段
+  (2) 打开数据库           booking/store.py: connect()
+  (3) 资源存在性检查       booking/store.py: resource_exists()
+  (4) 空闲区间计算与返回   booking/store.py: query_free_slots()
+
+关键次序：阶段 (1) 的任何失败都在阶段 (2) 之前返回，因此非法输入不会创建
+数据库文件、不会改动任何记录。这一点由 main() 的结构保证——校验全部放在
+try 块内、connect 之前（booking/__main__.py:248-299）：
+
+    # 先解析参数并完成全部输入校验，之后才连接/初始化数据库，
+    # 保证非法输入不会新建文件或改动任何记录。
+    try:
+        args = parser.parse_args(argv)
+        ...
+    except UsageError:
+        return invalid_input()
+
+    # 输入合法后再打开数据库（不存在则初始化），后续进程沿用同一文件。
+    conn = store.connect(args.db)
+
+--------------------------------------------------------------------------------
+2. 阶段一：参数解析与输入校验
+--------------------------------------------------------------------------------
+
+2.1 命令行形状
+
+free-query 接受四个参数（booking/__main__.py:236-241）：
+
+    p_free_query = subparsers.add_parser("free-query")
+    p_free_query.add_argument("--resource", required=True)
+    p_free_query.add_argument("--start", required=True)
+    p_free_query.add_argument("--end", required=True)
+    # 可选：只保留窗口内连续分钟数不低于该值的空闲区间；缺省不过滤。
+    p_free_query.add_argument("--min-minutes", default=None)
+
+argparse 本身的报错（缺参数、未知参数等）被自定义解析器 _Parser.error
+转成 UsageError（booking/__main__.py:53-57），与值校验失败走同一路径，
+因此 argparse 不会自己写 stderr。
+
+2.2 资源标识：parse_positive_int（booking/__main__.py:69-91）
+
+  - 只接受纯数字文本（允许前导零），正则 POSITIVE_INT_RE = ^\d+\Z。
+    \Z 锚定绝对结尾，"1\n"、首尾空白、制表符、负号、小数一律拒绝。
+  - 纯零（"0"、"000"）不是正整数，拒绝。
+  - 数值在 [1, 2^63-1] 内返回 int；超过 SQLite INTEGER 上限的正整数
+    返回哨兵 OVERSIZED_ID（booking/__main__.py:44-46）。这是合法输入，
+    留到阶段三按“标识不存在”处理，绝不绑定给 SQLite（否则 OverflowError）。
+
+2.3 时间窗口：parse_time_window（booking/__main__.py:150-164）
+
+    def parse_time_window(start_text, end_text):
+        start_dt = parse_time(start_text)
+        end_dt = parse_time(end_text)
+        if not start_dt < end_dt:
+            raise UsageError("start must be strictly before end")
+        return start_text, end_text
+
+  - parse_time（booking/__main__.py:139-147）要求严格的定宽格式
+    YYYY-MM-DDTHH:mm（正则 ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$），拒绝秒、
+    时区后缀、非零填充、首尾空白；不存在的日期（如 2026-02-30）由
+    strptime 抛 ValueError 转为 UsageError。
+  - 解析成功后统一附加固定时区 UTC+08:00（TIMEZONE_OFFSET，
+    booking/__main__.py:16），分钟精度。比较先后时两端点时区相同，
+    等价于直接比较本地墙钟时间。
+  - 唯一的关系约束是 start 严格早于 end。因此：
+      * 起止相等（start == end）：不合法，invalid_input。
+      * 起止倒置（start > end）：不合法，invalid_input。
+      * 过去日期：合法。校验只比较两个端点之间的关系，不与“现在”比较。
+      * 跨午夜窗口（如 2026-10-05T22:00 至 2026-10-06T02:00）：合法。
+        端点带完整日期，start < end 自然成立。
+  - 校验通过时返回原始文本（不是解析后的 datetime）。定宽文本的字典序
+    与时间先后一致，存储层直接按文本比较，成功结果也原样回显入参。
+
+2.4 最小时长：parse_min_minutes（booking/__main__.py:116-123）
+
+  - 省略 --min-minutes 时 min_minutes 为 None，表示不过滤。
+  - 给出时必须是 1 至 1440（MAX_MIN_MINUTES，一天 24 小时的分钟数）的
+    ASCII 十进制整数文本，允许任意前导零（"030" 即 30）。
+  - 空文本、纯零、负数、小数、含空白/换行、非 ASCII 数字（全角等）、
+    超出范围，一律 UsageError。共同文本规则集中在
+    parse_bounded_ascii_int（booking/__main__.py:94-113）。
+
+2.5 校验失败的统一出口
+
+任何 UsageError 都走到（booking/__main__.py:295-296）：
+
+    except UsageError:
+        return invalid_input()
+
+invalid_input()（booking/__main__.py:65-66）向标准输出打印
+{"error": "invalid_input"}，退出码 2，标准错误为空。非法时间、非法资源
+标识、非法最小时长不加区分，全部这一种输出；且先于“资源是否存在”的
+判断，也先于数据库的打开——不创建数据库文件，不迁移旧库。
+
+--------------------------------------------------------------------------------
+3. 阶段二：打开数据库
+--------------------------------------------------------------------------------
+
+全部输入合法后才调用 store.connect(args.db)（booking/store.py:22-39）：
+
+  - 文件不存在时由 sqlite3.connect 创建，并执行 SCHEMA 建表
+    （CREATE TABLE IF NOT EXISTS resources / bookings）。
+  - 对取消功能上线前创建的旧库，若 bookings 表缺 cancelled 列，则
+    ALTER TABLE 补上，已有预约一律视为未取消（默认值 0）。
+  - 连接置于 autocommit 模式并启用外键。
+
+需要区分两类“写”：free-query 本身只读——不增删预约、不消耗任何标识；
+但合法请求打开数据库这一步可能初始化新文件或补齐旧库的 cancelled 列。
+因此准确的说法是“查询不改动业务数据”，而不是“绝不写文件”。
+
+--------------------------------------------------------------------------------
+4. 阶段三：资源存在性检查
+--------------------------------------------------------------------------------
+
+连接打开后、发起任何查询前，先处理超大标识（booking/__main__.py:306-308）：
+
+    if args.command in ("reserve", "day-query", "free-query"):
+        if resource_id is OVERSIZED_ID:
+            return _emit({"error": "resource_not_found"}, 2)
+
+任何真实标识都不可能超过 2^63-1，故超出 SQLite 整数上限的正整数标识
+（输入合法）直接按不存在短路。此时连接已正常打开，合法输入原有的建库
+初始化与旧库兼容行为保持不变。
+
+随后 store.resource_exists(conn, resource_id)（booking/store.py:76-80）
+在 resources 表查主键；不存在则输出 {"error": "resource_not_found"}，
+退出码 2，标准错误为空（booking/__main__.py:342-344）。
+
+--------------------------------------------------------------------------------
+5. 阶段四：空闲区间计算 query_free_slots（booking/store.py:153-191）
+--------------------------------------------------------------------------------
+
+5.1 取出窗口内的占用
+
+    rows = conn.execute(
+        """
+        SELECT start, end FROM bookings
+        WHERE resource_id = ? AND cancelled = 0
+          AND start < ? AND end > ?
+        ORDER BY start ASC, id ASC
+        """,
+        (resource_id, end, start),
+    ).fetchall()
+
+  - 只统计同一资源（resource_id = ?）且未取消（cancelled = 0）的预约；
+    其他资源的预约、已取消的预约都不影响空闲结果。
+  - 相交判定 start < end AND end > start 是左闭右开 [start, end) 语义：
+    端点刚好相接（占用 end == 窗口 start，或占用 start == 窗口 end）
+    不算重叠，该占用整段不参与计算。
+  - 结果按开始时间升序（开始相同再按 id 升序），供下面单趟扫描使用。
+
+5.2 单趟扫描切出空闲段
+
+    free_slots = []
+    cursor = start
+    for booking_start, booking_end in rows:
+        # 只保留落在窗口内的相交部分（定宽文本，字典序即时间先后）。
+        busy_start = max(booking_start, start)
+        busy_end = min(booking_end, end)
+        if cursor < busy_start:
+            free_slots.append({"start": cursor, "end": busy_start})
+        if cursor < busy_end:
+            cursor = busy_end
+    if cursor < end:
+        free_slots.append({"start": cursor, "end": end})
+
+  - 每条占用先被截断到窗口内：busy_start = max(占用起点, 窗口起点)，
+    busy_end = min(占用终点, 窗口终点)。这就是“跨出窗口的占用只按相交
+    部分计算”的原因——一条 09:00-10:00 的占用遇到 09:30 开始的窗口，
+    参与计算的只有 09:30-10:00。
+  - cursor 表示“当前已确认空闲到的位置”。cursor 与下一段占用的起点
+    之间若有空隙，就是一个空闲区间；随后 cursor 推进到该占用的终点。
+  - 只有 cursor < busy_start 才产生空闲项：两条占用端点相接（前一条
+    end == 后一条 start）时中间没有零长度空闲项，结果只含非空区间，
+    相邻两项之间必有占用时段。
+  - 区间是“最大连续”的：扫描只按占用切分，绝不把一段空闲拆小，也不
+    跨占用把几段空闲的时长拼接起来。
+
+5.3 最小时长过滤
+
+    if min_minutes is not None:
+        # 区间已按窗口截断，其完整时长即窗口内的连续分钟数。
+        free_slots = [
+            slot
+            for slot in free_slots
+            if _minutes_between(slot["start"], slot["end"]) >= min_minutes
+        ]
+
+  - _minutes_between（booking/store.py:194-205）按完整日期时间求差，
+    跨午夜区间经过的分钟数自然计入；输入为分钟精度，结果必为整数分钟。
+  - 比较是 >=：时长恰好等于阈值的区间保留。
+  - 过滤只做“保留/丢弃”：合格区间保留完整起止端点，不缩成指定长度、
+    不拆分、不跨占用拼接。
+
+5.4 结果返回
+
+main() 把结果包装为（booking/__main__.py:348-356）：
+
+    {
+        "resource_id": resource_id,
+        "start": start,          # 原样回显入参文本
+        "end": end,
+        "free_slots": free_slots # 每项只含 start 与 end（完整日期时间文本）
+    }
+
+free_slots 按开始时间升序；没有达标区间时是空数组 []，仍属成功，
+退出码 0，标准错误为空。查询是只读的：不增删预约、不消耗标识。
+
+--------------------------------------------------------------------------------
+6. 完整示例（两次查询共用同一份数据）
+--------------------------------------------------------------------------------
+
+以下命令在全新环境可完整复现，不依赖任何已有数据库。资源标识以登记
+命令的实际输出为准（全新数据库下为 1）。
+
+6.1 准备数据
+
+    python3 -m booking --db demo.db resource-add --name "会议室A"
+    # 输出：{"resource_id": 1, "name": "会议室A"}        退出码 0
+
+    python3 -m booking --db demo.db reserve --resource 1 \
+        --start 2026-10-05T09:00 --end 2026-10-05T10:00
+    # 输出：{"booking_id": 1, "resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}
+
+    python3 -m booking --db demo.db reserve --resource 1 \
+        --start 2026-10-05T10:30 --end 2026-10-05T11:00
+    # 输出：{"booking_id": 2, "resource_id": 1, "start": "2026-10-05T10:30", "end": "2026-10-05T11:00"}
+
+此时资源 1 在 2026-10-05 有两条未取消预约：09:00-10:00、10:30-11:00。
+
+6.2 示例一：最小时长 30 分钟
+
+    python3 -m booking --db demo.db free-query --resource 1 \
+        --start 2026-10-05T09:30 --end 2026-10-05T12:00 --min-minutes 30
+
+预期输出（退出码 0，标准错误为空）：
+
+    {"resource_id": 1, "start": "2026-10-05T09:30", "end": "2026-10-05T12:00", "free_slots": [{"start": "2026-10-05T10:00", "end": "2026-10-05T10:30"}, {"start": "2026-10-05T11:00", "end": "2026-10-05T12:00"}]}
+
+推导过程（对照 5.2）：
+  - 占用 09:00-10:00 截断到窗口内为 09:30-10:00（首条占用只计算与窗口
+    相交的部分），cursor 从 09:30 直接推进到 10:00，不产生空闲项。
+  - 10:00 与下一条占用 10:30-11:00 之间：空闲 10:00-10:30（30 分钟）。
+  - 11:00 到窗口终点：空闲 11:00-12:00（60 分钟）。
+  - 两段时长均 >= 30，都保留；等于阈值的 10:00-10:30 因 >= 比较而保留。
+  - 11:00-12:00 有 60 分钟，远超阈值，但合格区间保留完整端点，不缩成
+    30 分钟。
+
+6.3 示例二：最小时长 31 分钟（同一份数据）
+
+    python3 -m booking --db demo.db free-query --resource 1 \
+        --start 2026-10-05T09:30 --end 2026-10-05T12:00 --min-minutes 31
+
+预期输出（退出码 0，标准错误为空）：
+
+    {"resource_id": 1, "start": "2026-10-05T09:30", "end": "2026-10-05T12:00", "free_slots": [{"start": "2026-10-05T11:00", "end": "2026-10-05T12:00"}]}
+
+10:00-10:30 只有 30 分钟 < 31，被过滤；11:00-12:00 为 60 分钟，保留
+完整端点。两次查询的 free_slots 均按开始时间升序。
+
+--------------------------------------------------------------------------------
+7. 边界与错误行为汇总（均已实测核对）
+--------------------------------------------------------------------------------
+
+  - 只有同一资源的未取消预约影响空闲结果；已取消预约（cancelled = 1）
+    和其他资源的预约不参与计算（store.py 的 SQL 条件）。
+  - 端点相接的占用之间没有零长度空闲项；结果只含非空的最大连续区间，
+    不跨占用拼接时长。
+  - 没有达标区间时仍成功：free_slots 为 []，退出码 0，标准错误为空。
+  - 非法时间、非法资源标识、非法最小时长：统一输出
+    {"error": "invalid_input"}，退出码 2，标准错误为空；先于资源是否
+    存在的判断，不创建数据库、不迁移旧库。
+  - 全部输入合法但资源不存在（包括超出 SQLite 整数上限 2^63-1 的正整数
+    标识）：输出 {"error": "resource_not_found"}，退出码 2，标准错误为空。
+  - 查询本身只读（不增删预约、不消耗标识），但合法请求打开数据库时可能
+    初始化新文件或补齐旧库的 cancelled 列——不能概括为“绝不写文件”。
+  - 其他入口（resource-add、reserve、cancel、resource-list、day-query）
+    的既有行为不在本文范围，保持不变。
+================================================================================
