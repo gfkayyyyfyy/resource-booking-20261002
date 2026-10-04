@@ -80,17 +80,43 @@ def resource_exists(conn, resource_id):
     return row is not None
 
 
-def has_conflict(conn, resource_id, start, end):
-    """同一资源上是否存在与 [start, end) 相交的未取消预约（左闭右开）。"""
-    row = conn.execute(
-        """
-        SELECT 1 FROM bookings
-        WHERE resource_id = ? AND cancelled = 0
-          AND start < ? AND end > ?
-        LIMIT 1
-        """,
-        (resource_id, end, start),
-    ).fetchone()
+# 同资源时段冲突规则只维护这一份：只有同一资源的未取消预约与
+# [start, end) 相交（左闭右开，端点相接不冲突）才算阻挡。
+# 创建（insert_bookings/insert_booking）与改期（reschedule_booking）
+# 都通过 has_conflict 使用它；改期时另以 exclude_id 排除目标预约自身，
+# 使新旧时段重叠乃至完全不变都允许成功，除此之外不改变规则。
+# SQL 片段含两个命名占位符 :window_end、:window_start，以及按
+# exclude_id 是否提供而二选一的 :exclude_id 命名占位符。
+_CONFLICT_EXISTS_SQL = """
+SELECT 1 FROM bookings
+WHERE resource_id = :resource_id AND cancelled = 0
+  AND start < :window_end AND end > :window_start
+"""
+_CONFLICT_EXISTS_EXCLUDE_SQL = _CONFLICT_EXISTS_SQL + "  AND id != :exclude_id\n"
+
+
+def has_conflict(conn, resource_id, start, end, exclude_id=None):
+    """同一资源上是否存在与 [start, end) 相交的未取消预约（左闭右开）。
+
+    创建与改期共用的冲突判断只在此维护：只统计同一资源的未取消预约，
+    已取消预约与其他资源一律不阻挡；start < end 与 end > start 两个
+    比较共同表达左闭右开，端点相接（一端 start 等于另一端 end）不算
+    重叠，部分重叠、完全相同与包含关系均判定冲突。
+
+    exclude_id 不为 None 时排除该标识的预约：仅供改期排除目标行自身，
+    使目标预约与自己的旧时段重叠乃至时段完全不变都允许成功；其他预约
+    仍照常阻挡。创建路径不传 exclude_id，检查全部已有占用。
+    """
+    params = {
+        "resource_id": resource_id,
+        "window_start": start,
+        "window_end": end,
+    }
+    sql = _CONFLICT_EXISTS_SQL
+    if exclude_id is not None:
+        sql = _CONFLICT_EXISTS_EXCLUDE_SQL
+        params["exclude_id"] = exclude_id
+    row = conn.execute(sql + "LIMIT 1", params).fetchone()
     return row is not None
 
 
@@ -123,12 +149,13 @@ def reschedule_booking(conn, booking_id, start, end):
     (None, "booking_not_found")；新时段与同资源“其他”未取消预约相交
     （左闭右开）返回 (None, "booking_conflict")。
 
-    冲突比较显式排除目标行（id != booking_id）：目标预约自身不阻挡
-    改期，因此新旧时段重叠乃至时段完全不变都允许成功；端点相接同样
-    不冲突。任一检查失败即回滚，旧时段、取消状态与其他记录全部保持
-    不变，不会出现只释放旧时段的中间结果。成功时只更新该行的起止
-    文本：不新增预约、不消耗标识、不改资源归属与其他任何记录。
-    每周重复预约在库中各自独立，本函数只改指定的一行。
+    冲突判断复用创建路径同一条规则（见 has_conflict），只额外以
+    exclude_id 排除目标行：目标预约自身不阻挡改期，因此新旧时段重叠
+    乃至时段完全不变都允许成功；端点相接同样不冲突。任一检查失败即
+    回滚，旧时段、取消状态与其他记录全部保持不变，不会出现只释放旧
+    时段的中间结果。成功时只更新该行的起止文本：不新增预约、不消耗
+    标识、不改资源归属与其他任何记录。每周重复预约在库中各自独立，
+    本函数只改指定的一行。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -141,16 +168,7 @@ def reschedule_booking(conn, booking_id, start, end):
             conn.rollback()
             return None, "booking_not_found"
         resource_id = row[0]
-        clash = conn.execute(
-            """
-            SELECT 1 FROM bookings
-            WHERE id != ? AND resource_id = ? AND cancelled = 0
-              AND start < ? AND end > ?
-            LIMIT 1
-            """,
-            (booking_id, resource_id, end, start),
-        ).fetchone()
-        if clash is not None:
+        if has_conflict(conn, resource_id, start, end, exclude_id=booking_id):
             conn.rollback()
             return None, "booking_conflict"
         conn.execute(
