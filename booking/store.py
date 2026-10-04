@@ -52,16 +52,25 @@ def insert_resource(conn, name):
     return resource_id
 
 
-def list_resources(conn):
+def list_resources(conn, contains=None):
     """返回全部资源，按 resource_id 数值升序。
 
     每项只含 resource_id 与 name；name 为登记时保存的原值，
     不去重、不按名称排序。只读查询，不写入任何记录、不消耗标识。
+
+    contains 不为 None 时只返回名称包含该片段的资源：区分大小写的
+    连续子串比较，百分号、下划线等一律按普通字符处理，不做通配、
+    正则或字符归一化。在 Python 侧用 in 判断而非 SQL LIKE，
+    从机制上保证片段里没有字符会被当作通配符。
     """
     rows = conn.execute(
         "SELECT id, name FROM resources ORDER BY id ASC"
     ).fetchall()
-    return [{"resource_id": row[0], "name": row[1]} for row in rows]
+    return [
+        {"resource_id": row[0], "name": row[1]}
+        for row in rows
+        if contains is None or contains in row[1]
+    ]
 
 
 def resource_exists(conn, resource_id):
