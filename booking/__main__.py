@@ -16,9 +16,12 @@ from . import store
 TIMEZONE_OFFSET = datetime.timezone(datetime.timedelta(hours=8))
 
 # 严格的 YYYY-MM-DDTHH:mm 定宽格式（拒绝秒、时区后缀、非零填充等）。
-TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
-# 严格的 YYYY-MM-DD 定宽日期格式。
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# 数字位必须用 [0-9] 而非 \d：\d 会匹配全角、阿拉伯文等各语种十进制
+# 数字，而 strptime/int 也接受它们，会让 "２０２６-10-05T09:00" 之类的
+# 文本通过校验并按原文入库，使同一天因数字写法不同绕过冲突判断与查询。
+TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$")
+# 严格的 YYYY-MM-DD 定宽日期格式（数字位同样只接受 ASCII 0-9）。
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 # 只接受纯数字文本（允许前导零）；数值上限另行判断。
 # 必须用 \Z 锚定字符串绝对结尾，不能用 $：$ 允许在末尾 LF 之前匹配，
 # 会让 "1\n" 被当成 1、"0\n" 进入纯零分支后触发未捕获的 ValueError。
