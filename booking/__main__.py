@@ -254,12 +254,13 @@ def main(argv):
         elif args.command == "reserve":
             resource_id = parse_positive_int(args.resource)
             start, end = parse_time_window(args.start, args.end)
-            # 省略 --repeat-weeks 时保持单次预约语义；给出时先校验次数文本，
-            # 再生成全部区间（任一端点越界同样视为非法输入），与标识、时间
-            # 校验一起先于资源存在性检查。
-            occurrences = None
-            if args.repeat_weeks is not None:
-                occurrences = repeat_occurrences(
+            # 省略 --repeat-weeks 时保持单次预约语义（只含原始区间一项）；
+            # 给出时先校验次数文本，再生成全部区间（任一端点越界同样视为
+            # 非法输入），与标识、时间校验一起先于资源存在性检查。
+            if args.repeat_weeks is None:
+                intervals = [(start, end)]
+            else:
+                intervals = repeat_occurrences(
                     start, end, parse_repeat_weeks(args.repeat_weeks)
                 )
         elif args.command == "cancel":
@@ -347,38 +348,34 @@ def main(argv):
                 0,
             )
 
-        if args.command == "reserve" and occurrences is not None:
-            booking_ids, error = store.insert_bookings(
-                conn, resource_id, occurrences
-            )
-            if error == "resource_not_found":
-                return _emit({"error": "resource_not_found"}, 2)
-            if error == "booking_conflict":
-                return _emit({"error": "booking_conflict"}, 2)
-            return _emit(
-                {
-                    "resource_id": resource_id,
-                    "bookings": [
-                        {"booking_id": booking_id, "start": s, "end": e}
-                        for booking_id, (s, e) in zip(booking_ids, occurrences)
-                    ],
-                },
-                0,
-            )
-
-        booking_id, error = store.insert_booking(
-            conn, resource_id, start, end
+        # reserve 是最后一个分支：单次与每周重复共用 store.insert_bookings
+        # 这一个创建入口（资源检查、冲突处理与保存在存储层集中维护），仅成功
+        # 输出结构不同——单次回显单条预约并保留输入时间文本，重复返回按发生
+        # 时间升序的 bookings，每项携带各自独立的 booking_id。
+        booking_ids, error = store.insert_bookings(
+            conn, resource_id, intervals
         )
         if error == "resource_not_found":
             return _emit({"error": "resource_not_found"}, 2)
         if error == "booking_conflict":
             return _emit({"error": "booking_conflict"}, 2)
+        if args.repeat_weeks is None:
+            return _emit(
+                {
+                    "booking_id": booking_ids[0],
+                    "resource_id": resource_id,
+                    "start": start,
+                    "end": end,
+                },
+                0,
+            )
         return _emit(
             {
-                "booking_id": booking_id,
                 "resource_id": resource_id,
-                "start": start,
-                "end": end,
+                "bookings": [
+                    {"booking_id": booking_id, "start": s, "end": e}
+                    for booking_id, (s, e) in zip(booking_ids, intervals)
+                ],
             },
             0,
         )

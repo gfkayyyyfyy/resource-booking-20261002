@@ -197,15 +197,21 @@ def _minutes_between(start, end):
 
 
 def insert_bookings(conn, resource_id, intervals):
-    """在单个事务内为同一资源创建多条预约：全部成功或全部失败。
+    """在单个事务内为同一资源创建一条或多条预约：全部成功或全部失败。
 
-    intervals 为按发生时间升序的 (start, end) 定宽文本对。依次检查资源
-    存在、生成区间彼此不重叠（左闭右开，端点相接不冲突）以及与同资源
-    未取消预约不冲突；任一检查失败即回滚，不新增记录、不消耗预约标识。
-    成功返回 (booking_ids, None)，标识与 intervals 按顺序一一对应，各项
-    独立分配且不复用；资源不存在返回 (None, "resource_not_found")，
-    冲突返回 (None, "booking_conflict")。各条预约持久化为普通预约，
-    不记录任何组标识。
+    单次预约与每周重复预约共用这一个创建入口（单次即只含一对区间的
+    列表），资源检查、冲突处理与保存的共同规则只在此维护：先在
+    BEGIN IMMEDIATE 事务内确认资源存在，再逐条校验与同资源未取消预约
+    不冲突，并借相邻区间的上一端点校验本次生成的区间彼此不重叠
+    （区间按开始时间升序，彼此重叠当且仅当相邻两项相交；左闭右开，
+    端点相接不冲突），全部检查通过后才依次插入；任一检查失败即回滚，
+    不新增记录、不消耗预约标识。
+
+    intervals 为按发生时间升序的 (start, end) 定宽文本对。成功返回
+    (booking_ids, None)，标识与 intervals 按顺序一一对应，各项独立
+    分配且不复用；资源不存在返回 (None, "resource_not_found")，冲突
+    返回 (None, "booking_conflict")。各条预约持久化为普通预约，不记录
+    任何组标识。时间以定宽文本存储，字典序即时间先后。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -214,7 +220,6 @@ def insert_bookings(conn, resource_id, intervals):
             return None, "resource_not_found"
         previous_end = None
         for start, end in intervals:
-            # 区间按开始时间升序：彼此重叠当且仅当相邻两项相交。
             if previous_end is not None and previous_end > start:
                 conn.rollback()
                 return None, "booking_conflict"
@@ -234,30 +239,3 @@ def insert_bookings(conn, resource_id, intervals):
         conn.rollback()
         raise
     return booking_ids, None
-
-
-def insert_booking(conn, resource_id, start, end):
-    """在事务内依次检查资源存在与时段冲突，返回 booking_id。
-
-    返回 (booking_id, None)；资源不存在返回 (None, "resource_not_found")；
-    时段冲突返回 (None, "booking_conflict")。失败时回滚，不改动任何记录。
-    时间以定宽文本存储，字典序即时间先后。
-    """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        if not resource_exists(conn, resource_id):
-            conn.rollback()
-            return None, "resource_not_found"
-        if has_conflict(conn, resource_id, start, end):
-            conn.rollback()
-            return None, "booking_conflict"
-        cur = conn.execute(
-            "INSERT INTO bookings (resource_id, start, end) VALUES (?, ?, ?)",
-            (resource_id, start, end),
-        )
-        booking_id = cur.lastrowid
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return booking_id, None
