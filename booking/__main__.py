@@ -30,6 +30,11 @@ MIN_MINUTES_RE = re.compile(r"^[0-9]+\Z")
 # --min-minutes 的取值上限：一天 24 小时的分钟数。
 MAX_MIN_MINUTES = 1440
 _MAX_MIN_MINUTES_DIGITS = str(MAX_MIN_MINUTES)
+# --repeat-weeks 同样只接受 ASCII 数字文本，值为包含首次在内的总次数。
+REPEAT_WEEKS_RE = re.compile(r"^[0-9]+\Z")
+MIN_REPEAT_WEEKS = 2
+MAX_REPEAT_WEEKS = 8
+_MAX_REPEAT_WEEKS_DIGITS = str(MAX_REPEAT_WEEKS)
 # SQLite INTEGER 主键可表示的最大有符号整数；任何真实存在的资源/预约
 # 标识都不可能超过它，因此更大的正整数一律等价于“标识不存在”。
 SQLITE_MAX_ID = 2 ** 63 - 1
@@ -106,6 +111,27 @@ def parse_min_minutes(text):
     return value
 
 
+def parse_repeat_weeks(text):
+    """解析 reserve 的 --repeat-weeks：2 至 8 的十进制整数文本，允许前导零。
+
+    只接受 ASCII 数字；缺值（由 argparse 拦截）、空文本、纯零、1、负数、
+    小数、超出 2–8 范围或含空白等其他字符（含非 ASCII 十进制数字）一律
+    视为非法输入。先剥前导零再按位数判断，与 parse_min_minutes 同一套
+    规则，避免把超长数字串直接交给 int()。
+    """
+    if text is None or not REPEAT_WEEKS_RE.match(text):
+        raise UsageError("expected integer repeat weeks in [2, 8]")
+    stripped = text.lstrip("0")
+    if not stripped:  # 纯零（含 "0"、"000"）不在 [2, 8] 内。
+        raise UsageError("expected integer repeat weeks in [2, 8]")
+    if len(stripped) > len(_MAX_REPEAT_WEEKS_DIGITS):
+        raise UsageError("expected integer repeat weeks in [2, 8]")
+    value = int(stripped)
+    if not MIN_REPEAT_WEEKS <= value <= MAX_REPEAT_WEEKS:
+        raise UsageError("expected integer repeat weeks in [2, 8]")
+    return value
+
+
 def parse_time(text):
     """严格解析 YYYY-MM-DDTHH:mm，返回带 UTC+08:00 时区的 datetime。"""
     if text is None or not TIME_RE.match(text):
@@ -134,6 +160,34 @@ def parse_time_window(start_text, end_text):
     return start_text, end_text
 
 
+def build_weekly_slots(start_text, end_text, count):
+    """由首次区间生成每周同一时段的 count 个区间，返回按发生时间升序的
+    [(start, end), ...] 定宽文本（首项即原始起止文本）。
+
+    后续每次把两个端点分别推进七个本地日历日（固定 UTC+08:00），保持
+    分钟精度，不进行任何时区换算；允许过去日期与跨午夜区间。任一端点
+    超出可表示的日期范围（9999-12-31 之后）时抛 UsageError，由调用方
+    统一按 invalid_input 处理（先于资源检查，不打开/改动数据库）。
+    """
+    start_dt = parse_time(start_text)
+    end_dt = parse_time(end_text)
+    week = datetime.timedelta(weeks=1)
+    slots = []
+    for index in range(count):
+        try:
+            occurrence_start = start_dt + week * index
+            occurrence_end = end_dt + week * index
+        except OverflowError:
+            raise UsageError("occurrence out of date range")
+        slots.append(
+            (
+                occurrence_start.strftime("%Y-%m-%dT%H:%M"),
+                occurrence_end.strftime("%Y-%m-%dT%H:%M"),
+            )
+        )
+    return slots
+
+
 def parse_date(text):
     """严格解析零填充 YYYY-MM-DD，返回带 UTC+08:00 时区的 date。"""
     if text is None or not DATE_RE.match(text):
@@ -156,6 +210,9 @@ def build_parser():
     p_reserve.add_argument("--resource", required=True)
     p_reserve.add_argument("--start", required=True)
     p_reserve.add_argument("--end", required=True)
+    # 可选：创建每周同一时段的重复预约，值为包含首次在内的总次数（2–8）；
+    # 省略时为原有单次预约，输入、输出与错误语义保持不变。
+    p_reserve.add_argument("--repeat-weeks", default=None)
 
     p_cancel = subparsers.add_parser("cancel")
     p_cancel.add_argument("--booking", required=True)
@@ -189,6 +246,13 @@ def main(argv):
         elif args.command == "reserve":
             resource_id = parse_positive_int(args.resource)
             start, end = parse_time_window(args.start, args.end)
+            slots = None
+            if args.repeat_weeks is not None:
+                # 生成全部每周区间（含日期范围校验）：与其他输入校验一样
+                # 先于资源检查与数据库连接，非法时不建库、不迁移、不改动数据。
+                slots = build_weekly_slots(
+                    start, end, parse_repeat_weeks(args.repeat_weeks)
+                )
         elif args.command == "cancel":
             booking_id = parse_positive_int(args.booking)
         elif args.command == "resource-list":
@@ -270,6 +334,32 @@ def main(argv):
                     "start": start,
                     "end": end,
                     "free_slots": free_slots,
+                },
+                0,
+            )
+
+        if slots is not None:
+            # 每周重复预约：整批全部成功或全部失败。失败时存储层在任何
+            # INSERT 之前回滚，不保存新预约、不改动原记录、不消耗标识。
+            booking_ids, error = store.insert_bookings(
+                conn, resource_id, slots
+            )
+            if error == "resource_not_found":
+                return _emit({"error": "resource_not_found"}, 2)
+            if error == "booking_conflict":
+                return _emit({"error": "booking_conflict"}, 2)
+            return _emit(
+                {
+                    "resource_id": resource_id,
+                    "bookings": [
+                        {
+                            "booking_id": booking_id,
+                            "start": occurrence_start,
+                            "end": occurrence_end,
+                        }
+                        for booking_id, (occurrence_start, occurrence_end)
+                        in zip(booking_ids, slots)
+                    ],
                 },
                 0,
             )

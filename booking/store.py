@@ -221,3 +221,45 @@ def insert_booking(conn, resource_id, start, end):
         conn.rollback()
         raise
     return booking_id, None
+
+
+def insert_bookings(conn, resource_id, slots):
+    """在单个事务内原子创建多个预约（每周重复预约使用）。
+
+    slots 为按发生时间升序的 (start, end) 定宽文本序列。整批要么全部
+    成功，要么全部失败：先检查资源存在，再检查本次生成区间彼此不重叠，
+    最后逐一检查与同资源未取消预约不冲突，全部通过后才依次插入并提交。
+    左闭右开：区间端点相接不算冲突。
+
+    返回 (booking_ids, None)，booking_ids 与 slots 同序；资源不存在返回
+    (None, "resource_not_found")；本次区间互相重叠或与已有未取消预约
+    重叠返回 (None, "booking_conflict")。失败路径在任何 INSERT 之前回滚，
+    不写入新预约、不改动原记录，也不消耗 AUTOINCREMENT 标识。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not resource_exists(conn, resource_id):
+            conn.rollback()
+            return None, "resource_not_found"
+        # slots 已按开始时间升序；存在重叠必然体现在某对相邻区间上
+        # （前一区间的 end 严格大于后一区间的 start；相等为端点相接）。
+        for index in range(1, len(slots)):
+            if slots[index - 1][1] > slots[index][0]:
+                conn.rollback()
+                return None, "booking_conflict"
+        for start, end in slots:
+            if has_conflict(conn, resource_id, start, end):
+                conn.rollback()
+                return None, "booking_conflict"
+        booking_ids = []
+        for start, end in slots:
+            cur = conn.execute(
+                "INSERT INTO bookings (resource_id, start, end) VALUES (?, ?, ?)",
+                (resource_id, start, end),
+            )
+            booking_ids.append(cur.lastrowid)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return booking_ids, None
