@@ -419,6 +419,6 @@ id / resource_id / start / end / cancelled 五列，不记录任何组标识，
     test_valid_repeat_weeks_with_oversized_resource_returns_resource_not_found、
     test_resource_not_found_failure_does_not_create_bookings
 
-其他入口（resource-add、resource-list、cancel、day-query、free-query）
+其他入口（resource-add、resource-list、cancel、reschedule、day-query、free-query）
 的既有行为不在本文范围，保持不变。
 ================================================================================

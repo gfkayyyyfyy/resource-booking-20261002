@@ -228,6 +228,13 @@ def build_parser():
     p_cancel = subparsers.add_parser("cancel")
     p_cancel.add_argument("--booking", required=True)
 
+    p_reschedule = subparsers.add_parser("reschedule")
+    p_reschedule.add_argument("--booking", required=True)
+    p_reschedule.add_argument("--start", required=True)
+    p_reschedule.add_argument("--end", required=True)
+    # 改期只作用于指定的一条预约，不提供 --repeat-weeks：每周重复预约
+    # 在库中各自独立，改期只改这一项，其他各项不受影响。
+
     p_list = subparsers.add_parser("resource-list")
     # 可选：只返回保存后的名称包含该片段的资源；缺省返回完整目录。
     p_list.add_argument("--contains", default=None)
@@ -273,6 +280,13 @@ def main(argv):
                 )
         elif args.command == "cancel":
             booking_id = parse_positive_int(args.booking)
+        elif args.command == "reschedule":
+            # 标识与时间窗口的校验先于打开数据库：非法输入不建文件、
+            # 不迁移旧库、不改数据；时间规则（固定 UTC+08:00、严格
+            # YYYY-MM-DDTHH:mm、ASCII 数字、开始严格早于结束）与
+            # reserve/free-query 完全一致，允许过去日期与跨日区间。
+            booking_id = parse_positive_int(args.booking)
+            start, end = parse_time_window(args.start, args.end)
         elif args.command == "resource-list":
             # --contains 去除首尾空白后参与匹配（中间空格保留）；
             # 缺省为 None 表示不筛选，空文本或纯空白一律非法。
@@ -316,7 +330,7 @@ def main(argv):
         if args.command in ("reserve", "day-query", "free-query"):
             if resource_id is OVERSIZED_ID:
                 return _emit({"error": "resource_not_found"}, 2)
-        elif args.command == "cancel":
+        elif args.command in ("cancel", "reschedule"):
             if booking_id is OVERSIZED_ID:
                 return _emit({"error": "booking_not_found"}, 2)
 
@@ -333,6 +347,27 @@ def main(argv):
             if not store.cancel_booking(conn, booking_id):
                 return _emit({"error": "booking_not_found"}, 2)
             return _emit({"booking_id": booking_id, "cancelled": True}, 0)
+
+        if args.command == "reschedule":
+            resource_id, error = store.reschedule_booking(
+                conn, booking_id, start, end
+            )
+            if error == "booking_not_found":
+                return _emit({"error": "booking_not_found"}, 2)
+            if error == "booking_conflict":
+                # 冲突时存储层已回滚：原时段与取消状态均不变，
+                # 不会出现只释放旧时段的结果。
+                return _emit({"error": "booking_conflict"}, 2)
+            # 成功只回显四个字段；标识保持原值，时间保留输入文本。
+            return _emit(
+                {
+                    "booking_id": booking_id,
+                    "resource_id": resource_id,
+                    "start": start,
+                    "end": end,
+                },
+                0,
+            )
 
         if args.command == "day-query":
             if not store.resource_exists(conn, resource_id):

@@ -357,6 +357,6 @@ free_slots 按开始时间升序；开启 --first-only 时至多一项，没有�
     标识）：输出 {"error": "resource_not_found"}，退出码 2，标准错误为空。
   - 查询本身只读（不增删预约、不消耗标识），但合法请求打开数据库时可能
     初始化新文件或补齐旧库的 cancelled 列——不能概括为“绝不写文件”。
-  - 其他入口（resource-add、reserve、cancel、resource-list、day-query）
+  - 其他入口（resource-add、reserve、cancel、reschedule、resource-list、day-query）
     的既有行为不在本文范围，保持不变。
 ================================================================================
