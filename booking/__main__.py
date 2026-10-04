@@ -24,6 +24,11 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # 会让 "1\n" 被当成 1、"0\n" 进入纯零分支后触发未捕获的 ValueError。
 # \Z 不接受任何尾随字符，首尾空白、制表符、CR 或夹在数字中间的 LF 一律拒绝。
 POSITIVE_INT_RE = re.compile(r"^\d+\Z")
+# --min-minutes 只接受 ASCII 数字（与标识不同，不接受 Unicode 十进制数字），
+# 数值范围另行判断；同样用 \Z 锚定绝对结尾，拒绝任何首尾/夹带空白。
+MIN_MINUTES_RE = re.compile(r"^[0-9]+\Z")
+# --min-minutes 的数值上限（含）：一天 24 小时的分钟数。
+MAX_MIN_MINUTES = 1440
 # SQLite INTEGER 主键可表示的最大有符号整数；任何真实存在的资源/预约
 # 标识都不可能超过它，因此更大的正整数一律等价于“标识不存在”。
 SQLITE_MAX_ID = 2 ** 63 - 1
@@ -79,6 +84,26 @@ def parse_positive_int(text):
     return value
 
 
+def parse_min_minutes(text):
+    """解析可选的 --min-minutes：省略返回 None，否则返回 [1, 1440] 的 int。
+
+    只接受纯 ASCII 数字文本（允许前导零，按数值解释）；空文本、零、负数、
+    小数、超出范围或含空白及其他字符一律视为非法输入。先按位数排除过大
+    数值再交给 int()，避免超长数字串触发转换位数限制。
+    """
+    if text is None:
+        return None
+    if not MIN_MINUTES_RE.match(text):
+        raise UsageError("expected integer minutes in [1, 1440]")
+    digits = text.lstrip("0")
+    if not digits or len(digits) > len(str(MAX_MIN_MINUTES)):
+        raise UsageError("expected integer minutes in [1, 1440]")
+    value = int(digits)
+    if not 1 <= value <= MAX_MIN_MINUTES:
+        raise UsageError("expected integer minutes in [1, 1440]")
+    return value
+
+
 def parse_time(text):
     """严格解析 YYYY-MM-DDTHH:mm，返回带 UTC+08:00 时区的 datetime。"""
     if text is None or not TIME_RE.match(text):
@@ -126,6 +151,7 @@ def build_parser():
     p_free_query.add_argument("--resource", required=True)
     p_free_query.add_argument("--start", required=True)
     p_free_query.add_argument("--end", required=True)
+    p_free_query.add_argument("--min-minutes", default=None)
 
     return parser
 
@@ -167,6 +193,7 @@ def main(argv):
             end_dt = parse_time(args.end)
             if not start_dt < end_dt:
                 raise UsageError("start must be strictly before end")
+            min_minutes = parse_min_minutes(args.min_minutes)
             start, end = args.start, args.end
         else:  # pragma: no cover - argparse 已保证
             raise UsageError("unknown command")
@@ -221,7 +248,7 @@ def main(argv):
             if not store.resource_exists(conn, resource_id):
                 return _emit({"error": "resource_not_found"}, 2)
             free_slots = store.query_free_slots(
-                conn, resource_id, start, end
+                conn, resource_id, start, end, min_minutes
             )
             return _emit(
                 {

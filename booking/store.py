@@ -1,5 +1,6 @@
 """共享资源预约台：SQLite 持久化层。"""
 
+import datetime
 import sqlite3
 
 SCHEMA = """
@@ -140,12 +141,22 @@ def query_day_bookings(conn, resource_id, day_start, day_end):
     ]
 
 
-def query_free_slots(conn, resource_id, start, end):
+def _slot_minutes(slot):
+    """空闲区间在窗口内的连续分钟数（起止均为定宽文本，按完整日期时间求差）。"""
+    fmt = "%Y-%m-%dT%H:%M"
+    start = datetime.datetime.strptime(slot["start"], fmt)
+    end = datetime.datetime.strptime(slot["end"], fmt)
+    return int((end - start).total_seconds()) // 60
+
+
+def query_free_slots(conn, resource_id, start, end, min_minutes=None):
     """返回 [start, end) 内全部最大连续空闲区间，按开始时间升序。
 
     只统计同一资源的未取消预约；跨出窗口的预约只按相交部分截断。
     左闭右开：端点相接不算重叠。结果只含非空区间，相邻两项之间必有
     占用时段。每项只含 start 与 end（完整日期时间文本）。
+    min_minutes 不为 None 时，只保留窗口内连续分钟数达到该值的区间；
+    合格区间保留完整起止端点，不截断、不拆分。
     只读查询，不写入任何记录。
     """
     rows = conn.execute(
@@ -169,6 +180,11 @@ def query_free_slots(conn, resource_id, start, end):
             cursor = busy_end
     if cursor < end:
         free_slots.append({"start": cursor, "end": end})
+    if min_minutes is not None:
+        free_slots = [
+            slot for slot in free_slots
+            if _slot_minutes(slot) >= min_minutes
+        ]
     return free_slots
 
 
