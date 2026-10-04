@@ -1,0 +1,424 @@
+================================================================================
+reserve --repeat-weeks 每周重复预约创建流程说明
+================================================================================
+
+本文独立描述一次每周重复预约（reserve --repeat-weeks）从命令行输入到 JSON
+输出的完整创建流程，全部结论均可对照源码核实。涉及文件只有两个：
+
+  booking/__main__.py   命令行入口、参数解析与校验、区间生成、错误输出
+  booking/store.py      SQLite 持久化层、资源检查、冲突判断、事务写入
+
+本文只描述既有行为，不改动任何产品代码、公开命令、输出协议、既有测试或
+旧数据库兼容行为。
+
+--------------------------------------------------------------------------------
+1. 总体流程概览
+--------------------------------------------------------------------------------
+
+一次 reserve --repeat-weeks 依次经过四个阶段，顺序固定：
+
+  (1) 参数解析与输入校验   booking/__main__.py: main() 前半段
+                           （含 repeat_occurrences 生成全部周区间）
+  (2) 打开数据库           booking/store.py: connect()
+  (3) 资源检查与冲突判断   booking/store.py: insert_bookings()
+                           （resource_exists / 自重叠检查 / has_conflict）
+  (4) 事务写入与结果返回   booking/store.py: insert_bookings() 后半段
+                           booking/__main__.py: main() 的 reserve 分支
+
+关键次序：阶段 (1) 的任何失败都在阶段 (2) 之前返回，因此非法输入不会创建
+数据库文件、不会改动任何记录、不会迁移旧库。这一点由 main() 的结构保证
+——校验全部放在 try 块内、connect 之前（booking/__main__.py:253-299）：
+
+    # 先解析参数并完成全部输入校验，之后才连接/初始化数据库，
+    # 保证非法输入不会新建文件或改动任何记录。
+    try:
+        args = parser.parse_args(argv)
+        ...
+    except UsageError:
+        return invalid_input()
+
+    # 输入合法后再打开数据库（不存在则初始化），后续进程沿用同一文件。
+    conn = store.connect(args.db)
+
+阶段 (3)(4) 同在 insert_bookings 的单个事务内：全部检查通过才写入，
+任一检查失败即回滚——这就是“全部成功或全部失败”的实现位置。
+
+--------------------------------------------------------------------------------
+2. 阶段一：参数解析与输入校验
+--------------------------------------------------------------------------------
+
+2.1 命令行形状
+
+reserve 接受四个参数（booking/__main__.py:221-226）：
+
+    p_reserve = subparsers.add_parser("reserve")
+    p_reserve.add_argument("--resource", required=True)
+    p_reserve.add_argument("--start", required=True)
+    p_reserve.add_argument("--end", required=True)
+    # 可选：每周同一时段的重复预约总次数（含首次）；缺省为单次预约。
+    p_reserve.add_argument("--repeat-weeks", default=None)
+
+省略 --repeat-weeks 时保持单次预约语义（走 insert_booking，输出结构不变，
+见 booking/__main__.py:380-395）；给出时才进入本文描述的重复创建路径。
+argparse 本身的报错（缺参数、未知参数、--repeat-weeks 缺值等）被自定义
+解析器 _Parser.error 转成 UsageError（booking/__main__.py:56-60），与值
+校验失败走同一路径，因此 argparse 不会自己写 stderr。
+
+main() 中 reserve 分支的校验顺序（booking/__main__.py:259-269）：
+
+    elif args.command == "reserve":
+        resource_id = parse_positive_int(args.resource)
+        start, end = parse_time_window(args.start, args.end)
+        # 省略 --repeat-weeks 时保持单次预约语义；给出时先校验次数文本，
+        # 再生成全部区间（任一端点越界同样视为非法输入），与标识、时间
+        # 校验一起先于资源存在性检查。
+        occurrences = None
+        if args.repeat_weeks is not None:
+            occurrences = repeat_occurrences(
+                start, end, parse_repeat_weeks(args.repeat_weeks)
+            )
+
+2.2 资源标识：parse_positive_int（booking/__main__.py:72-94）
+
+  - 只接受纯数字文本（允许前导零），正则 POSITIVE_INT_RE = ^\d+\Z。
+    \Z 锚定绝对结尾，"1\n"、首尾空白、制表符、负号、小数一律拒绝。
+  - 纯零（"0"、"000"）不是正整数，拒绝。
+  - 数值在 [1, 2^63-1] 内返回 int；超过 SQLite INTEGER 上限的正整数
+    返回哨兵 OVERSIZED_ID（booking/__main__.py:49）。这是合法输入，
+    留到阶段三之前按“标识不存在”短路，绝不绑定给 SQLite。
+
+2.3 时间窗口：parse_time_window（booking/__main__.py:153-167）
+
+  - parse_time（booking/__main__.py:142-150）要求严格的定宽格式
+    YYYY-MM-DDTHH:mm（正则 ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$），
+    拒绝秒、时区后缀、非零填充、首尾空白；不存在的日期由 strptime 抛
+    ValueError 转为 UsageError。
+  - 解析成功后统一附加固定时区 UTC+08:00（TIMEZONE_OFFSET，
+    booking/__main__.py:16），分钟精度。所有输入时间都按这个固定时区
+    解释，与机器时区无关。
+  - 唯一的关系约束是 start 严格早于 end：起止相等或倒置都是
+    invalid_input。过去日期与跨午夜窗口不在此限制，继续合法——校验只
+    比较两个端点之间的关系，不与“现在”比较；跨午夜窗口端点带完整日期，
+    start < end 自然成立。
+  - 校验通过时返回原始文本。定宽文本的字典序与时间先后一致，存储层
+    直接按文本比较，成功结果也原样回显。
+
+2.4 重复次数：parse_repeat_weeks（booking/__main__.py:129-139）
+
+  - 取值范围 [2, 8]（MIN_REPEAT_WEEKS / MAX_REPEAT_WEEKS，
+    booking/__main__.py:40-41），含义是包含首次在内的总次数：
+    --repeat-weeks 2 即首周加次周共两条预约。
+  - 文本规则集中在 parse_bounded_ascii_int（booking/__main__.py:97-116）：
+    只接受非空 ASCII 十进制数字（^[0-9]+\Z），允许任意数量前导零、按
+    实际数值解释（"002" 即 2）；空文本、纯零、负数、小数、含空白/制表
+    符/换行、非 ASCII 数字（全角、阿拉伯文等）、数值不在 [2, 8] 内，
+    一律 UsageError。先剥前导零再按位数判断，不把超长数字串直接交给
+    int()，故五千个 9 之类的输入也走同一非法路径。
+
+2.5 按周生成区间：repeat_occurrences（booking/__main__.py:191-210）
+
+    def repeat_occurrences(start, end, count):
+        start_dt = parse_time(start)
+        end_dt = parse_time(end)
+        occurrences = []
+        for index in range(count):
+            try:
+                occurrence_start = start_dt + datetime.timedelta(weeks=index)
+                occurrence_end = end_dt + datetime.timedelta(weeks=index)
+            except OverflowError:
+                raise UsageError("repeat endpoint out of representable date range")
+            occurrences.append(
+                (_format_time(occurrence_start), _format_time(occurrence_end))
+            )
+        return occurrences
+
+  - 首次区间（index = 0）就是原始起止文本本身；之后每次把两个端点分别
+    推进七个本地日历日（timedelta(weeks=index)，固定 UTC+08:00，分钟
+    精度）。两个端点独立推进，因此跨午夜区间（如 23:00 至次日 01:00）
+    整体平移，形状不变。
+  - 结果按发生时间升序（index 递增即时间递增），共 count 项，含首次。
+  - 任一生成端点超出可表示的日期范围（如 9999-12-28 起再推进一周）
+    时，timedelta 加法抛 OverflowError，转为 UsageError，按
+    invalid_input 处理——此时尚未打开数据库。
+  - _format_time（booking/__main__.py:180-188）把端点格式化回定宽
+    YYYY-MM-DDTHH:mm 文本（年份手工零填充），与首次区间的原始文本
+    形式一致，后续存储与比较统一按定宽文本进行。
+
+2.6 校验失败的统一出口
+
+上述任何 UsageError 都走到（booking/__main__.py:298-299）：
+
+    except UsageError:
+        return invalid_input()
+
+invalid_input()（booking/__main__.py:68-69）向标准输出打印
+{"error": "invalid_input"}，退出码 2，标准错误为空。非法标识、非法
+时间、非法次数、生成端点越界不加区分，全部这一种输出；且先于数据库
+的打开——不创建数据库文件、不迁移旧库（不补齐 cancelled 列）、不改动
+任何记录。非法输入与“资源不存在”同时出现时，优先 invalid_input。
+
+--------------------------------------------------------------------------------
+3. 阶段二：打开数据库
+--------------------------------------------------------------------------------
+
+全部输入合法后才调用 store.connect(args.db)（booking/store.py:22-39）：
+
+  - 文件不存在时由 sqlite3.connect 创建，并执行 SCHEMA 建表
+    （CREATE TABLE IF NOT EXISTS resources / bookings）。
+  - 对取消功能上线前创建的旧库，若 bookings 表缺 cancelled 列，则
+    ALTER TABLE 补上，已有预约一律视为未取消（默认值 0）。
+  - 连接置于 autocommit 模式并启用外键；事务由调用方用
+    BEGIN IMMEDIATE 显式管理，保证多进程下“检查冲突 + 写入”的原子性。
+
+连接打开后、发起任何查询前，先处理超大标识（booking/__main__.py:309-311）：
+resource_id 为 OVERSIZED_ID 时直接输出 {"error": "resource_not_found"}，
+退出码 2。任何真实标识都不可能超过 2^63-1，故这是“合法输入但标识必然
+不存在”的短路，不消耗标识、不写入记录。
+
+--------------------------------------------------------------------------------
+4. 阶段三与四：资源检查、冲突判断与事务写入
+   insert_bookings（booking/store.py:208-248）
+--------------------------------------------------------------------------------
+
+重复创建走 booking/__main__.py:361-378 的分支，核心全部在
+insert_bookings。单次预约 insert_booking（booking/store.py:251-264）
+就是本函数的单区间情形，两条路径共享同一套检查与写入规则。
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not resource_exists(conn, resource_id):
+            conn.rollback()
+            return None, "resource_not_found"
+        previous_end = None
+        for start, end in intervals:
+            # 区间按开始时间升序：彼此重叠当且仅当相邻两项相交。
+            if previous_end is not None and previous_end > start:
+                conn.rollback()
+                return None, "booking_conflict"
+            if has_conflict(conn, resource_id, start, end):
+                conn.rollback()
+                return None, "booking_conflict"
+            previous_end = end
+        booking_ids = []
+        for start, end in intervals:
+            cur = conn.execute(
+                "INSERT INTO bookings (resource_id, start, end) VALUES (?, ?, ?)",
+                (resource_id, start, end),
+            )
+            booking_ids.append(cur.lastrowid)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return booking_ids, None
+
+4.1 资源存在性检查
+
+进入事务后第一步：resource_exists（booking/store.py:76-80）在 resources
+表查主键。不存在则回滚并返回 (None, "resource_not_found")，main() 输出
+{"error": "resource_not_found"}，退出码 2，标准错误为空
+（booking/__main__.py:365-366）。此时未写入任何记录、未消耗预约标识。
+
+4.2 生成区间彼此重叠检查
+
+intervals 按发生时间升序（由 repeat_occurrences 保证），故彼此重叠当且
+仅当相邻两项相交：前一项的 end 大于后一项的 start 即冲突（左闭右开，
+端点相接 previous_end == start 不冲突）。时长大于七天的区间会与自己
+的下一周副本重叠，在此被拒绝。任一重叠即回滚，返回
+(None, "booking_conflict")。
+
+4.3 与既有预约的冲突检查：has_conflict（booking/store.py:83-94）
+
+    SELECT 1 FROM bookings
+    WHERE resource_id = ? AND cancelled = 0
+      AND start < ? AND end > ?
+    LIMIT 1
+
+  - 只统计同一资源（resource_id = ?）且未取消（cancelled = 0）的预约；
+    已取消的预约和其他资源的预约不阻挡。
+  - 相交判定 start < end AND end > start 是左闭右开 [start, end) 语义：
+    端点刚好相接（既有 end == 新区间 start，或既有 start == 新区间 end）
+    不算冲突。
+  - 对 count 个生成区间逐一检查，任一区间与既有占用相交即回滚，返回
+    (None, "booking_conflict")，main() 输出 {"error": "booking_conflict"}，
+    退出码 2，标准错误为空（booking/__main__.py:367-368）。
+
+4.4 事务写入与标识分配
+
+全部检查通过后，在同一个 BEGIN IMMEDIATE 事务内逐条 INSERT，每条由
+AUTOINCREMENT 主键独立分配 booking_id，与 intervals 按顺序一一对应，
+最后一次 commit。各条预约持久化为普通预约：bookings 表只有
+id / resource_id / start / end / cancelled 五列，不记录任何组标识，
+各项之间没有任何关联。
+
+4.5 冲突失败为何不产生部分预约、不改变原记录、不消耗预约标识
+
+  - 不产生部分预约：检查循环（4.1-4.3）与写入循环（4.4）分离，全部
+    检查通过后才执行第一条 INSERT；任一检查失败时还没有任何写入，
+    rollback 撤销的是空事务。
+  - 不改变原记录：整个流程对既有行只有 SELECT，没有 UPDATE/DELETE；
+    失败路径的 rollback 保证事务内不留任何痕迹。
+  - 不消耗预约标识：booking_id 由 bookings 表的 INTEGER PRIMARY KEY
+    AUTOINCREMENT 在 INSERT 时分配；失败路径一条 INSERT 都没执行，
+    AUTOINCREMENT 计数器不前进，因此下一条成功预约的标识紧接上一条
+    成功预约，失败请求不留标识缺口。
+
+--------------------------------------------------------------------------------
+5. 成功输出与后续行为
+--------------------------------------------------------------------------------
+
+5.1 成功输出（booking/__main__.py:369-378）
+
+    {
+        "resource_id": resource_id,
+        "bookings": [
+            {"booking_id": booking_id, "start": s, "end": e}
+            for booking_id, (s, e) in zip(booking_ids, occurrences)
+        ]
+    }
+
+  - 顶层只有 resource_id 与 bookings 两个键；bookings 每项只有
+    booking_id、start、end 三个键。
+  - bookings 按发生时间升序（occurrences 的顺序），标识随发生时间
+    递增分配，各项标识互不相同。
+  - 退出码 0，标准错误为空。
+
+5.2 各项是普通预约
+
+  - 持久化为普通预约后，day-query、free-query 等查询照常可见；
+    重开数据库（每条命令都是独立进程）结果不变。
+  - cancel 只取消指定一项（store.cancel_booking，
+    booking/store.py:97-116）：按 booking_id 把该项 cancelled 置 1，
+    其余各项不受影响；被取消的时段恢复可预约。
+  - 标识不复用：AUTOINCREMENT 单调前进，取消或失败都不会让旧标识
+    再次被分配。
+
+--------------------------------------------------------------------------------
+6. 完整示例（全新数据库，可复现，已实测核对）
+--------------------------------------------------------------------------------
+
+以下命令在项目根目录依次执行，不依赖任何已有数据库。标识按这份新库的
+分配顺序写明：资源登记得 resource_id 1，首次占用得 booking_id 1；
+冲突的重复请求不消耗标识，故重试成功的两项为 booking_id 2 与 3。
+
+6.1 准备数据
+
+    python3 -m booking --db demo.db resource-add --name "会议室A"
+    # 输出：{"resource_id": 1, "name": "会议室A"}        退出码 0
+
+    python3 -m booking --db demo.db reserve --resource 1 \
+        --start 2026-10-12T09:00 --end 2026-10-12T10:00
+    # 输出：{"booking_id": 1, "resource_id": 1, "start": "2026-10-12T09:00", "end": "2026-10-12T10:00"}
+    # 退出码 0
+
+此时资源 1 在 2026-10-12 09:00-10:00 有一条未取消预约（booking_id 1）。
+
+6.2 第一次重复请求：次周被占用，整批冲突
+
+    python3 -m booking --db demo.db reserve --resource 1 \
+        --start 2026-10-05T09:00 --end 2026-10-05T10:00 --repeat-weeks 2
+
+预期输出（退出码 2，标准错误为空）：
+
+    {"error": "booking_conflict"}
+
+推导过程：生成区间为 2026-10-05T09:00-10:00（首次）与
+2026-10-12T09:00-10:00（推进七天）；第二周区间与既有预约 1 相交
+（has_conflict 命中），整批回滚。
+
+核对状态——首周无新增，原占用不变：
+
+    python3 -m booking --db demo.db day-query --resource 1 --date 2026-10-05
+    # {"resource_id": 1, "date": "2026-10-05", "bookings": []}
+
+    python3 -m booking --db demo.db day-query --resource 1 --date 2026-10-12
+    # {"resource_id": 1, "date": "2026-10-12", "bookings": [{"booking_id": 1, "start": "2026-10-12T09:00", "end": "2026-10-12T10:00"}]}
+
+6.3 取消原占用后，以相同参数重试：成功
+
+    python3 -m booking --db demo.db cancel --booking 1
+    # 输出：{"booking_id": 1, "cancelled": true}        退出码 0
+
+    python3 -m booking --db demo.db reserve --resource 1 \
+        --start 2026-10-05T09:00 --end 2026-10-05T10:00 --repeat-weeks 2
+
+预期输出（退出码 0，标准错误为空）：
+
+    {"resource_id": 1, "bookings": [{"booking_id": 2, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}, {"booking_id": 3, "start": "2026-10-12T09:00", "end": "2026-10-12T10:00"}]}
+
+  - 已取消的预约 1 不参与冲突判断（has_conflict 的 cancelled = 0 条件），
+    故同一参数这次成功。
+  - 新标识是 2 和 3，紧接既有标识 1：6.2 的失败请求一条 INSERT 都没
+    执行，AUTOINCREMENT 计数器未前进，因此没有留下标识缺口。
+  - 两项是各自独立的普通预约，可分别查询、分别取消：
+
+    python3 -m booking --db demo.db day-query --resource 1 --date 2026-10-05
+    # {"resource_id": 1, "date": "2026-10-05", "bookings": [{"booking_id": 2, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}]}
+
+    python3 -m booking --db demo.db day-query --resource 1 --date 2026-10-12
+    # {"resource_id": 1, "date": "2026-10-12", "bookings": [{"booking_id": 3, "start": "2026-10-12T09:00", "end": "2026-10-12T10:00"}]}
+
+--------------------------------------------------------------------------------
+7. 边界与错误行为汇总（均已实测核对）
+--------------------------------------------------------------------------------
+
+  - --repeat-weeks 取值 2 至 8，为包含首次在内的总次数；前导零按数值
+    解释（"002" 即 2）。越界、非 ASCII 数字、空白、缺值等一律
+    {"error": "invalid_input"}，退出码 2，标准错误为空。
+  - 时间固定解释为 UTC+08:00；两个端点每次各自推进七个本地日历日，
+    允许过去日期与跨午夜区间，区间形状逐周不变。
+  - 任一生成端点超出可表示日期范围（如 9999-12-28 起重复）：与非法
+    次数一样输出 {"error": "invalid_input"}，退出码 2，且在打开数据库
+    之前结束——不创建数据库文件、不迁移旧库。
+  - 输入全部合法但资源不存在（含超出 SQLite 整数上限的正整数标识）：
+    {"error": "resource_not_found"}，退出码 2，标准错误为空，不新增
+    记录、不消耗预约标识。
+  - 既有占用冲突或生成区间彼此重叠：{"error": "booking_conflict"}，
+    退出码 2，标准错误为空；不产生部分预约、不改变原记录、不消耗
+    预约标识（单事务内先检查后写入，失败即回滚）。
+  - 端点相接不冲突（左闭右开）：与既有预约相接、生成区间彼此相接
+    （时长恰好七天）都不算重叠。已取消及其他资源的预约不阻挡。
+  - 成功结果按发生时间升序，各项是带独立标识的普通预约，不记录组
+    标识；cancel 只取消指定一项，标识不复用。
+  - 省略 --repeat-weeks 时单次预约的输出结构与行为保持不变。
+
+--------------------------------------------------------------------------------
+8. 对应测试（test_repeat_weeks.py，python -m unittest 可发现）
+--------------------------------------------------------------------------------
+
+  - 6.2/6.3 的验收场景（冲突后取消重试、首周无新增、原占用不变、两个
+    独立预约、重开后可分别查询）：
+    test_acceptance_conflict_then_success_after_cancel
+  - 逐周推进七天、按发生时间升序、标识各自独立（8 次）：
+    test_success_shape_and_weekly_progression
+  - 前导零按数值解释：test_leading_zeros_accepted
+  - 跨午夜整体推进：test_cross_midnight_interval_repeats_by_calendar_days
+  - 过去日期允许：test_past_dates_allowed
+  - 端点相接不冲突（自身/既有）：
+    test_exactly_seven_day_intervals_do_not_self_conflict、
+    test_touching_existing_booking_does_not_conflict
+  - 已取消及其他资源预约不阻挡：
+    test_cancelled_and_other_resource_bookings_do_not_block
+  - 普通预约语义（查询可见、cancel 只取消指定项、标识不复用）：
+    test_repeat_bookings_are_plain_bookings_visible_and_cancellable
+  - 省略选项时单次输出不变：test_single_reserve_output_unchanged_without_option
+  - 冲突原子性（无部分预约、原记录不变、不消耗标识、重开后无痕迹）：
+    test_self_overlapping_intervals_return_booking_conflict、
+    test_conflict_is_atomic_and_does_not_consume_ids、
+    test_conflict_failure_persists_nothing_after_reopen
+  - 非法次数与端点越界（含不建库、不迁移旧库、优先级）：
+    test_invalid_repeat_weeks_values_return_invalid_input、
+    test_missing_repeat_weeks_value_returns_invalid_input、
+    test_generated_endpoint_out_of_range_returns_invalid_input、
+    test_invalid_repeat_weeks_takes_priority_over_resource_not_found、
+    test_invalid_repeat_weeks_takes_priority_over_time_window_errors、
+    test_invalid_repeat_weeks_does_not_create_database_file、
+    test_invalid_repeat_weeks_does_not_migrate_legacy_database
+  - 资源不存在（含超大标识、不消耗标识）：
+    test_valid_repeat_weeks_with_unknown_resource_returns_resource_not_found、
+    test_valid_repeat_weeks_with_oversized_resource_returns_resource_not_found、
+    test_resource_not_found_failure_does_not_create_bookings
+
+其他入口（resource-add、resource-list、cancel、day-query、free-query）
+的既有行为不在本文范围，保持不变。
+================================================================================
