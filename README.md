@@ -37,6 +37,12 @@ python -m booking --db demo.sqlite reserve --resource 1 \
 python -m booking --db demo.sqlite cancel --booking 1
 # {"booking_id": 1, "cancelled": true}
 
+# 将预约 2 改期到 10:00–11:00（左闭右开，与 09:00–10:00 端点相接，不冲突）
+python -m booking --db demo.sqlite reschedule --booking 2 \
+    --start 2026-10-05T10:00 --end 2026-10-05T11:00
+# {"booking_id": 2, "resource_id": 1, "start": "2026-10-05T10:00", "end": "2026-10-05T11:00"}
+# （booking_id 与 resource_id 保持原值，时间按输入原文返回；不新增预约）
+
 python -m booking --db demo.sqlite reserve --resource 1 \
     --start 2026-10-05T09:00 --end 2026-10-05T10:00
 # {"booking_id": 2, "resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}
@@ -87,6 +93,22 @@ cancel --booking <booking_id>
 - 预约标识不存在或已经取消时，统一返回 `{"error": "booking_not_found"}`，不改动任何记录。
 - 取消功能上线前创建的数据库文件直接兼容：首次打开时自动补齐取消标记列，已有预约一律视为未取消。
 
+### reschedule —— 单条预约改期
+
+```
+reschedule --booking <booking_id> --start <开始时间> --end <结束时间>
+```
+
+- 修改指定的**未取消**预约的时段，保留原资源与原 `booking_id`；不接受 `--repeat-weeks`（携带即按不支持的参数返回 `invalid_input`）。
+- 成功只返回四个字段：`{"booking_id": <正整数>, "resource_id": <正整数>, "start": "...", "end": "..."}`，标识与资源为原值，时间按输入格式原样返回。
+- 新时段沿用与 `reserve` 相同的时间规则：固定 UTC+08:00、严格零填充 `YYYY-MM-DDTHH:mm`、数字位只接受 ASCII `0`–`9`、开始严格早于结束，允许过去日期与跨日区间。
+- 冲突只检查**同一资源的其他未取消预约**，按左闭右开 `[start, end)` 判断：端点相接可成功；已取消预约与其他资源的预约不阻挡。目标预约自身不阻挡改期，因此新旧时段重叠、时段完全未变都成功。
+- 存在重叠时只返回 `{"error": "booking_conflict"}`：原时段与取消状态保持不变，不会出现只释放旧时段的中间结果，其他记录也不受影响。
+- 改期不新增预约、不消耗预约标识；每周重复预约只改指定的这一项，其余各项不受影响。
+- 改期结果立即生效并持久化：`day-query`/`free-query` 按新时段显示占用、原时段不再被该预约占用，重新打开同一数据库后保持一致。
+- 预约不存在、已经取消（不能通过改期恢复）或标识大于 2^63-1 时，统一返回 `{"error": "booking_not_found"}`，不改动任何记录。
+- 缺少参数、不支持的参数、非法标识、非法时间或起止顺序错误统一返回 `{"error": "invalid_input"}`，优先于预约存在性检查；非法输入不会新建数据库文件、不迁移旧库、不改数据。
+
 ### day-query —— 按日查询预约
 
 ```
@@ -131,7 +153,7 @@ free-query --resource <resource_id> --start <开始时间> --end <结束时间> 
 
 - `--resource`、`--booking` 接受任意十进制正整数文本，允许前导零并按数值解释：`0001` 与 `1` 指向同一标识。
 - 标识文本必须全部由十进制数字组成，不自动去除任何空白：首尾空格、制表符、LF、CR，或夹在数字中间的换行等非数字字符，一律按非整数处理返回 `{"error": "invalid_input"}`（如 `"1\n"` 不会被当成 `1`，`"0\n"` 也不会被当成 `0`）。
-- 标识由 SQLite `INTEGER` 主键分配，不可能超过 `9223372036854775807`（2^63-1）。大于该值的正整数（如 `9223372036854775808` 或连续五千个 `9`，无论带多少前导零）仍是合法输入，但等价于“标识不存在”：`reserve`/`day-query`/`free-query` 返回 `{"error": "resource_not_found"}`，`cancel` 返回 `{"error": "booking_not_found"}`；判定与十进制位数无关。
+- 标识由 SQLite `INTEGER` 主键分配，不可能超过 `9223372036854775807`（2^63-1）。大于该值的正整数（如 `9223372036854775808` 或连续五千个 `9`，无论带多少前导零）仍是合法输入，但等价于“标识不存在”：`reserve`/`day-query`/`free-query` 返回 `{"error": "resource_not_found"}`，`cancel`/`reschedule` 返回 `{"error": "booking_not_found"}`；判定与十进制位数无关。
 - 零、负数、小数及非整数文本不是正整数，一律返回 `{"error": "invalid_input"}`。
 - 检查顺序仍为：先输入合法性，再标识/资源是否存在，最后冲突判断。因此超大标识与非法日期、非法时间或起止顺序错误同时出现时，先返回 `invalid_input`。
 - 超大标识请求不新增任何记录，也不消耗资源或预约标识；作为合法输入，它与普通未知标识一样会正常打开数据库（不存在则初始化，旧库照常迁移）。
@@ -143,11 +165,11 @@ free-query --resource <resource_id> --start <开始时间> --end <结束时间> 
 | 情形 | 返回 | 退出码 |
 | --- | --- | --- |
 | 成功 | 见各命令 | `0` |
-| 参数缺失、资源标识不是正整数、名称为空、时间格式或日期无效、起止顺序错误、预约标识不是正整数（零、负数、小数、非整数）、查询日期格式不符或日期无效、`--min-minutes` 不是 1 至 1440 的 ASCII 十进制整数文本、给无值开关 `--first-only` 附加了值、`--repeat-weeks` 不是 2 至 8 的 ASCII 十进制整数文本或生成端点超出可表示日期范围 | `{"error": "invalid_input"}` | `2` |
+| 参数缺失、资源标识不是正整数、名称为空、时间格式或日期无效、起止顺序错误、预约标识不是正整数（零、负数、小数、非整数）、查询日期格式不符或日期无效、`--min-minutes` 不是 1 至 1440 的 ASCII 十进制整数文本、给无值开关 `--first-only` 附加了值、`--repeat-weeks` 不是 2 至 8 的 ASCII 十进制整数文本或生成端点超出可表示日期范围、`reschedule` 携带 `--repeat-weeks` 等不支持的参数 | `{"error": "invalid_input"}` | `2` |
 | 资源标识不存在（含大于 2^63-1 的正整数） | `{"error": "resource_not_found"}` | `2` |
-| 与同一资源已有预约时段重叠 | `{"error": "booking_conflict"}` | `2` |
-| 预约标识不存在或已经取消（含大于 2^63-1 的正整数；仅 cancel） | `{"error": "booking_not_found"}` | `2` |
+| 与同一资源已有预约时段重叠（`reserve`；`reschedule` 检查目标预约之外的其他未取消预约） | `{"error": "booking_conflict"}` | `2` |
+| 预约标识不存在或已经取消（含大于 2^63-1 的正整数；`cancel`、`reschedule`；已取消预约不能通过改期恢复） | `{"error": "booking_not_found"}` | `2` |
 
 ## 后续规划
 
-资源目录、预约取消、按日查询、空闲时段查询与每周重复预约之外，逐步支持站内提醒等能力。
+资源目录、预约取消、单条预约改期、按日查询、空闲时段查询与每周重复预约之外，逐步支持站内提醒等能力。

@@ -116,6 +116,55 @@ def cancel_booking(conn, booking_id):
     return True
 
 
+def reschedule_booking(conn, booking_id, start, end):
+    """在事务内修改一条未取消预约的时段，保留标识与资源。
+
+    返回 (resource_id, None)；预约不存在或已取消返回
+    (None, "booking_not_found")；新时段与同资源其他未取消预约重叠
+    （左闭右开，端点相接不冲突）返回 (None, "booking_conflict")。
+    任一失败都回滚：原时段、取消状态与其他记录保持不变，不会出现
+    只释放旧时段的中间结果。目标预约自身不阻挡改期，新旧时段重叠
+    也允许；时段未变同样成功。不新增预约、不消耗标识。
+
+    所有检查（存在/取消状态、冲突）与 UPDATE 都在同一个
+    BEGIN IMMEDIATE 事务内完成，保证多进程下“检查 + 写入”的原子性。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT resource_id, cancelled FROM bookings WHERE id = ?",
+            (booking_id,),
+        ).fetchone()
+        if row is None or row[1] != 0:
+            # 不存在或已取消（已取消预约不能通过改期恢复）。
+            conn.rollback()
+            return None, "booking_not_found"
+        resource_id = row[0]
+        # 冲突只检查同资源的“其他”未取消预约：显式排除目标自身，
+        # 故新旧时段重叠、时段未变都不会自阻挡。
+        conflict = conn.execute(
+            """
+            SELECT 1 FROM bookings
+            WHERE id != ? AND resource_id = ? AND cancelled = 0
+              AND start < ? AND end > ?
+            LIMIT 1
+            """,
+            (booking_id, resource_id, end, start),
+        ).fetchone()
+        if conflict is not None:
+            conn.rollback()
+            return None, "booking_conflict"
+        conn.execute(
+            "UPDATE bookings SET start = ?, end = ? WHERE id = ?",
+            (start, end, booking_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return resource_id, None
+
+
 def query_day_bookings(conn, resource_id, day_start, day_end):
     """返回指定资源上与 [day_start, day_end) 相交的未取消预约。
 

@@ -228,6 +228,11 @@ def build_parser():
     p_cancel = subparsers.add_parser("cancel")
     p_cancel.add_argument("--booking", required=True)
 
+    p_reschedule = subparsers.add_parser("reschedule")
+    p_reschedule.add_argument("--booking", required=True)
+    p_reschedule.add_argument("--start", required=True)
+    p_reschedule.add_argument("--end", required=True)
+
     p_list = subparsers.add_parser("resource-list")
     # 可选：只返回保存后的名称包含该片段的资源；缺省返回完整目录。
     p_list.add_argument("--contains", default=None)
@@ -273,6 +278,9 @@ def main(argv):
                 )
         elif args.command == "cancel":
             booking_id = parse_positive_int(args.booking)
+        elif args.command == "reschedule":
+            booking_id = parse_positive_int(args.booking)
+            start, end = parse_time_window(args.start, args.end)
         elif args.command == "resource-list":
             # --contains 去除首尾空白后参与匹配（中间空格保留）；
             # 缺省为 None 表示不筛选，空文本或纯空白一律非法。
@@ -316,7 +324,7 @@ def main(argv):
         if args.command in ("reserve", "day-query", "free-query"):
             if resource_id is OVERSIZED_ID:
                 return _emit({"error": "resource_not_found"}, 2)
-        elif args.command == "cancel":
+        elif args.command in ("cancel", "reschedule"):
             if booking_id is OVERSIZED_ID:
                 return _emit({"error": "booking_not_found"}, 2)
 
@@ -333,6 +341,27 @@ def main(argv):
             if not store.cancel_booking(conn, booking_id):
                 return _emit({"error": "booking_not_found"}, 2)
             return _emit({"booking_id": booking_id, "cancelled": True}, 0)
+
+        if args.command == "reschedule":
+            resource_id, error = store.reschedule_booking(
+                conn, booking_id, start, end
+            )
+            if error == "booking_not_found":
+                return _emit({"error": "booking_not_found"}, 2)
+            if error == "booking_conflict":
+                # 冲突时存储层已整体回滚：原时段与取消状态不变，
+                # 不会出现只释放旧时段的结果。
+                return _emit({"error": "booking_conflict"}, 2)
+            # 成功只回显四个字段：标识与资源保持原值，时间保留输入原文。
+            return _emit(
+                {
+                    "booking_id": booking_id,
+                    "resource_id": resource_id,
+                    "start": start,
+                    "end": end,
+                },
+                0,
+            )
 
         if args.command == "day-query":
             if not store.resource_exists(conn, resource_id):
