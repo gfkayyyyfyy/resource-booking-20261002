@@ -218,6 +218,10 @@ def build_parser():
     p_add = subparsers.add_parser("resource-add")
     p_add.add_argument("--name", required=True)
 
+    p_rename = subparsers.add_parser("resource-rename")
+    p_rename.add_argument("--resource", required=True)
+    p_rename.add_argument("--name", required=True)
+
     p_reserve = subparsers.add_parser("reserve")
     p_reserve.add_argument("--resource", required=True)
     p_reserve.add_argument("--start", required=True)
@@ -275,6 +279,15 @@ def main(argv):
     try:
         args = parser.parse_args(argv)
         if args.command == "resource-add":
+            name = args.name.strip()
+            if not name:
+                raise UsageError("name must not be empty")
+        elif args.command == "resource-rename":
+            # 标识与名称的校验先于打开数据库：标识沿用统一的正整数文本
+            # 规则（前导零与 Unicode 十进制数字按数值解释，不裁剪空白）；
+            # 名称沿用登记规则，去除首尾空白、内部空白与大小写保持原样，
+            # 空文本或纯空白一律非法。输入合法性优先于资源存在性。
+            resource_id = parse_positive_int(args.resource)
             name = args.name.strip()
             if not name:
                 raise UsageError("name must not be empty")
@@ -352,7 +365,8 @@ def main(argv):
         # SQLite（否则会抛 OverflowError）。此时连接已正常打开，因此合法输入
         # 原有的建库初始化与旧库兼容行为保持不变；invalid_input 已在连接前
         # 返回，优先级不受影响。
-        if args.command in ("reserve", "day-query", "free-query"):
+        if args.command in ("reserve", "day-query", "free-query",
+                            "resource-rename"):
             if resource_id is OVERSIZED_ID:
                 return _emit({"error": "resource_not_found"}, 2)
         elif args.command in ("cancel", "reschedule"):
@@ -361,6 +375,15 @@ def main(argv):
 
         if args.command == "resource-add":
             resource_id = store.insert_resource(conn, name)
+            return _emit(
+                {"resource_id": resource_id, "name": name}, 0
+            )
+
+        if args.command == "resource-rename":
+            # 改名只更新指定标识的名称：不新增资源、不消耗标识、
+            # 不影响任何预约；允许改成其他资源的名称，也允许名称不变。
+            if not store.rename_resource(conn, resource_id, name):
+                return _emit({"error": "resource_not_found"}, 2)
             return _emit(
                 {"resource_id": resource_id, "name": name}, 0
             )

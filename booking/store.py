@@ -95,6 +95,30 @@ def list_resources(conn, contains=None, window=None):
     ]
 
 
+def rename_resource(conn, resource_id, name):
+    """在事务内把指定资源的名称改为新值，保留原标识与全部预约。
+
+    资源不存在返回 False（不改动任何记录）；改名成功返回 True。
+    只更新该行的 name：不新增资源、不消耗资源或预约标识，不改变其他
+    资源的名称，也不影响任何预约的资源归属、起止时间与取消状态。
+    名称不做去重：允许改成与其他资源相同的名称，也允许新旧名称相同。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "UPDATE resources SET name = ? WHERE id = ?",
+            (name, resource_id),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
+
+
 def resource_exists(conn, resource_id):
     row = conn.execute(
         "SELECT 1 FROM resources WHERE id = ?", (resource_id,)
