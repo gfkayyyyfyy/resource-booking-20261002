@@ -1,0 +1,506 @@
+================================================================================
+resource-list 时段可预约筛选流程说明（--start / --end）
+================================================================================
+
+本文描述带 --start 与 --end 的资源目录查询（resource-list）从命令行输入
+到 JSON 资源列表的完整流程，覆盖输入校验、打开数据库、时段筛选与 JSON
+输出四个阶段，全部结论均可对照源码核实。涉及文件只有两个：
+
+  booking/__main__.py   命令行入口、参数解析与校验、错误输出
+  booking/store.py      SQLite 持久化层、目录读取与时段筛选
+
+resource-list 还支持既有的 --contains 名称片段筛选；不带 --start/--end
+（两个端点均省略）时的完整目录行为另有 RESOURCE_DIRECTORY_FLOW.txt
+说明，本文只在相关处简述，语义以该文为准。本文只补说明：不改动任何产品
+代码、公开命令、输出协议、既有测试、README 或数据库格式；其他入口
+（resource-add、reserve、cancel、reschedule、day-query、free-query）的
+行为均不在本文范围，保持不变。
+
+--------------------------------------------------------------------------------
+1. 总体流程概览
+--------------------------------------------------------------------------------
+
+一次带时段的 resource-list 依次经过四个阶段，顺序固定：
+
+  (1) 参数解析与输入校验   booking/__main__.py: main() 前半段
+                           （resource-list 分支，301-318 行）
+  (2) 打开数据库           booking/store.py: connect()（22-39 行）
+  (3) 目录读取与时段筛选   booking/store.py: list_resources()（55-95 行）
+  (4) 结果输出             booking/__main__.py: main() 的 resource-list 分支
+                           （368-371 行），经由 _emit()（63-65 行）
+
+关键次序：阶段 (1) 的任何失败都在阶段 (2) 之前返回，因此非法输入不会创建
+数据库文件、不会迁移旧库、不会改动任何记录。这一点由 main() 的结构保证
+——全部校验放在 try 块内、connect 之前（booking/__main__.py:271-348）：
+
+    # 先解析参数并完成全部输入校验，之后才连接/初始化数据库，
+    # 保证非法输入不会新建文件或改动任何记录。
+    try:
+        args = parser.parse_args(argv)
+        ...
+    except UsageError:
+        return invalid_input()
+
+    # 输入合法后再打开数据库（不存在则初始化），后续进程沿用同一文件。
+    conn = store.connect(args.db)
+
+--------------------------------------------------------------------------------
+2. 阶段一：参数解析与输入校验
+--------------------------------------------------------------------------------
+
+2.1 命令行形状
+
+resource-list 接受三个可选参数（booking/__main__.py:238-244）：
+
+    p_list = subparsers.add_parser("resource-list")
+    # 可选：只返回保存后的名称包含该片段的资源；缺省返回完整目录。
+    p_list.add_argument("--contains", default=None)
+    # 可选且必须成对出现：只返回 [start, end) 内没有任何未取消预约
+    # 相交的资源；两个都省略时不做时段筛选，保留原目录行为。
+    p_list.add_argument("--start", default=None)
+    p_list.add_argument("--end", default=None)
+
+  - --db 为全局必填参数（booking/__main__.py:215），值为 SQLite 文件路径。
+  - 三个参数的缺省值都是 None。--start/--end 的取值只有两种组合：
+      * 两个都省略：不做时段筛选，SQL 连 bookings 表都不访问（见 4.1），
+        保留原目录行为，预约多少都不影响目录结果；
+      * 两个都给出：做时段可预约筛选（见第 4 节）。
+    只给其中一个是第三种组合，直接判非法（见 2.2）。
+  - argparse 本身的报错（缺少 --db、未知子命令、未知参数、--start/--end
+    缺值等）被自定义解析器 _Parser.error 转成 UsageError
+    （booking/__main__.py:56-60），与值校验失败走同一路径，因此 argparse
+    不会自己向 stderr 输出用法文本。
+
+2.2 端点必须成对，且窗口校验先于打开数据库
+
+main() 的 resource-list 分支先处理 --contains（规则沿用既有语义，见
+2.4），再处理时间端点（booking/__main__.py:309-318）：
+
+    # --start 与 --end 必须成对提供：只给一端即非法；成对提供时
+    # 沿用与 reserve/free-query 相同的时间窗口校验（固定
+    # UTC+08:00、严格 YYYY-MM-DDTHH:mm、ASCII 数字、开始严格
+    # 早于结束，允许过去日期与跨日区间）；两个都省略时 window
+    # 保持 None，保留原目录行为。
+    window = None
+    if (args.start is None) != (args.end is None):
+        raise UsageError("--start and --end must be given together")
+    if args.start is not None:
+        window = parse_time_window(args.start, args.end)
+
+  - 用异或判断 `(args.start is None) != (args.end is None)`：恰好一个端点
+    为 None（只给 --start 或只给 --end）即抛 UsageError。
+  - 成对给出时交给 parse_time_window；校验通过后 window 是
+    (start, end) 原始文本对，原样传给存储层。
+  - 这些判断与解析全部位于 store.connect（booking/__main__.py:348）之前。
+
+2.3 时间窗口校验：parse_time_window / parse_time
+
+parse_time_window（booking/__main__.py:153-167）是 reserve、reschedule、
+free-query 与 resource-list 共用的同一份规则：
+
+    def parse_time_window(start_text, end_text):
+        start_dt = parse_time(start_text)
+        end_dt = parse_time(end_text)
+        if not start_dt < end_dt:
+            raise UsageError("start must be strictly before end")
+        return start_text, end_text
+
+单个端点由 parse_time（booking/__main__.py:142-150）解析：
+
+  - 必须严格匹配定宽正则 TIME_RE
+    （booking/__main__.py:22）：
+    ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$
+    因此下列文本一律拒绝：
+      * 带秒（2026-10-05T09:00:00）、时区后缀（...+08:00、...Z）；
+      * 未零填充（2026-10-5T09:00、2026-10-05T9:00）；
+      * 日期分隔符错误（2026/10/05T09:00）、以空格代替 T
+        （2026-10-05 09:00）；
+      * 首尾夹带空白（" 2026-10-05T09:00"、"2026-10-05T10:00\t"），
+        时间文本不像 --contains 那样做 strip。
+  - 数字位必须是 ASCII [0-9] 而不是 \\d：\\d 会匹配全角、阿拉伯文等各种
+    十进制数字，而 strptime/int 也接受它们（见 TIME_RE 上方注释，
+    booking/__main__.py:18-22）。故 "２０２６-10-05T09:00" 与
+    "2026-10-05T09:0０" 这类含非 ASCII 数字（含混写）的文本在正则阶段
+    即被拒绝。
+  - 形状通过后再用 strptime 校验日期真实存在：2026-02-30T09:00 等非法
+    日期抛 ValueError，被转成 UsageError（booking/__main__.py:146-149）。
+  - 解析成功后统一附加固定时区 UTC+08:00（TIMEZONE_OFFSET，
+    booking/__main__.py:15-16），分钟精度，与运行机器的时区无关。两端点
+    时区相同，先后比较等价于比较本地墙钟时间。
+
+parse_time_window 唯一的关系约束是开始严格早于结束：
+
+  - start == end（起止相等）：不合法；
+  - start > end（起止颠倒）：不合法；
+  - 过去日期：合法，校验不与“现在”比较；
+  - 跨午夜/跨日窗口（如 2026-10-05T23:00 至 2026-10-06T01:00）：合法，
+    端点带完整日期，start < end 自然成立。
+
+校验通过时返回的是入参原文而非 datetime：定宽文本的字典序与时间先后
+一致，存储层直接按文本比较。
+
+2.4 --contains：沿用既有名称片段语义
+
+--contains 的处理在时段校验之前（booking/__main__.py:302-308），规则与
+不带时段时完全一致：缺省为 None 不筛选；给出时先 strip 首尾空白（中间
+空格保留），strip 后为空文本/纯空白即 UsageError。匹配语义（区分大小写
+的连续子串、% 与 _ 按普通字符、Python in 而非 SQL LIKE）见
+RESOURCE_DIRECTORY_FLOW.txt 第 2、4 节。与 --start/--end 同用时两个
+条件取交集（见 4.4）。
+
+2.5 校验失败的统一出口
+
+下列情况全部抛 UsageError，被同一处 except 捕获
+（booking/__main__.py:344-345），转由 invalid_input()
+（booking/__main__.py:68-69）输出：
+
+  - 只提供一个端点：--start 2026-10-05T09:00 而无 --end（或反之）；
+  - 端点缺值：--start 后没有值、行尾只有 --end 等 argparse 报错；
+  - 非法日期：如 2026-02-30T09:00（形状合法但日期不存在）；
+  - 格式不符：带秒、时区后缀或 Z、未零填充、分隔符错误、空格代 T、
+    首尾空白等任何不匹配 TIME_RE 的文本；
+  - 非 ASCII 时间数字：全角/阿拉伯文数字及其与 ASCII 数字的混写；
+  - 开始不早于结束：起止相等或起止颠倒；
+  - --contains 缺值、空文本、纯空白，或出现 resource-list 不支持的参数
+    （既有规则，见 RESOURCE_DIRECTORY_FLOW.txt 2.3）。
+
+输出统一且唯一：向标准输出打印且只打印
+
+    {"error": "invalid_input"}
+
+退出码为 2，标准错误为空（没有用法文本，也没有异常堆栈），各类情况不
+区分文案。以上所有失败都在 store.connect 之前结束：不创建数据库文件、
+不触发旧库迁移、不触碰任何数据（见第 3 节）。
+
+--------------------------------------------------------------------------------
+3. 阶段二：打开数据库 store.connect（booking/store.py:22-39）
+--------------------------------------------------------------------------------
+
+只有输入全部合法后才调用 store.connect(args.db)：
+
+  - 文件不存在时，sqlite3.connect 创建该文件并执行 SCHEMA
+    （booking/store.py:6-19，CREATE TABLE IF NOT EXISTS resources /
+    bookings）。因此对一个不存在的路径执行合法的时段查询，返回空数组的
+    同时会在磁盘上留下初始化后的数据库文件。
+  - 对取消功能上线前创建的旧库，connect 用 PRAGMA table_info(bookings)
+    检查列；缺少 cancelled 列时 ALTER TABLE 补齐，已有预约一律视为未
+    取消（默认值 0），不重建数据（booking/store.py:34-38）。这条迁移是
+    所有命令共用的连接逻辑，resource-list 打开旧库时执行同一段代码。
+  - 连接置于 autocommit 模式并启用外键。
+
+“只读”的准确含义需要区分两类写：
+
+  - 业务数据层面，时段查询确实只读：list_resources 只执行一条 SELECT
+    （见第 4 节），不开始事务、不 INSERT/UPDATE/DELETE，不新增或删除
+    资源与预约，也不消耗 AUTOINCREMENT 标识（查询后再登记资源/预约，
+    新标识仍紧接原有最大标识）。
+  - 文件层面，打开数据库这一步本身可能写文件：不存在的路径会被初始化，
+    缺少 cancelled 列的旧库会被补齐。因此“查询只读”指业务记录不变，
+    不能解释成“绝不写文件”。
+
+--------------------------------------------------------------------------------
+4. 阶段三：目录读取与时段筛选 list_resources（booking/store.py:55-95）
+--------------------------------------------------------------------------------
+
+4.1 两条读取路径
+
+    if window is None:
+        rows = conn.execute(
+            "SELECT id, name FROM resources ORDER BY id ASC"
+        ).fetchall()
+    else:
+        start, end = window
+        rows = conn.execute(
+            """
+            SELECT id, name FROM resources
+            WHERE NOT EXISTS (
+                SELECT 1 FROM bookings
+                WHERE bookings.resource_id = resources.id
+                  AND cancelled = 0
+                  AND start < ? AND end > ?
+            )
+            ORDER BY id ASC
+            """,
+            (end, start),
+        ).fetchall()
+
+  - 两端点均省略（window is None）时走第一条：只扫描 resources 表，
+    bookings 表完全不参与，即原目录行为。
+  - 成对给出端点时走第二条：用相关子查询的 NOT EXISTS 排除“窗口内存在
+    相交占用”的资源。注意绑定参数顺序是 (end, start)：第一个占位符
+    （start < ?）绑窗口终点 end，第二个占位符（end > ?）绑窗口起点
+    start（booking/store.py:77-90）。
+  - 两条路径都 ORDER BY id ASC：按资源标识数值升序（标识 2 排在 10 之前，
+    而非文本序 "1","10","2"）；SQL 不做去重，同名资源各自是独立的一行。
+
+4.2 “整个窗口均可预约”的精确含义：正时长交集才排除
+
+一个资源被返回，当且仅当不存在同时满足下列全部条件的预约行：
+
+    bookings.resource_id = resources.id   -- 只看同一资源
+    AND cancelled = 0                     -- 只看未取消预约
+    AND start < :window_end               -- 占用开始严格早于窗口结束
+    AND end   > :window_start             -- 占用结束严格晚于窗口开始
+
+后两个比较合起来就是半开区间 [window_start, window_end) 上的“正时长
+交集”判定，与创建/改期共用的冲突规则 has_conflict 中的
+_CONFLICT_EXISTS_SQL 完全同构（booking/store.py:105-142）：
+
+  - 返回的资源在整个查询窗口 [start, end) 内都可预约：窗口内任何一个时刻
+    都没有同资源未取消预约覆盖。注意这是对“资源”的判断，不返回空闲
+    时段；窗口内只要存在任何正时长占用，该资源整体不出现。
+  - 端点相接不阻挡：预约 end == 窗口 start（占用恰在窗口开始时结束），
+    或预约 start == 窗口 end（占用恰在窗口结束时开始），都只有一个比较
+    取等号而被严格不等号排除，NOT EXISTS 成立，资源照常返回。相接是零
+    时长交集，不算占用。
+  - 任何正时长交集都排除该资源：部分重叠、预约包含窗口、窗口包含预约、
+    两者完全相同，均满足两个严格不等式。
+  - 取消记录不占用：cancelled = 1 的行不参与子查询；把同一条预约取消后
+    资源即在该窗口恢复可预约（取消动作见 cancel_booking，
+    booking/store.py:145-164）。
+  - 不同资源独立判断：子查询按 bookings.resource_id = resources.id
+    相关，一个资源的预约从不影响另一个资源；同名资源也各自独立。
+  - 没有任何预约的资源自然入选（子查询对它恒为空）；目录为空时结果就是
+    空数组。
+
+4.3 跨日与重复预约：按完整起止时间判断
+
+start/end 在库中是零填充的 YYYY-MM-DDTHH:mm 文本（SCHEMA，
+booking/store.py:11-18），定宽文本的字典序即时间先后，比较时携带完整
+日期，不按“同一天”截断：
+
+  - 跨日预约（如 2026-10-05T23:30 至 2026-10-06T00:30）与跨日查询窗口
+    按完整起止时间求交集；仅日期相同但时段不相交不构成阻挡。
+  - 重复预约（reserve --repeat-weeks）在入口侧被展开为多个普通区间
+    （repeat_occurrences，booking/__main__.py:191-210），存储层把每条
+    区间持久化为互相独立的普通预约行、不记录组标识
+    （insert_bookings，booking/store.py:323-363）。因此时段筛选对重复
+    预约没有特殊处理：任一次发生与窗口有正时长交集就排除该资源，不发生
+    的日期不受影响。
+
+4.4 名称片段与时段取交集；结果项的构造
+
+SQL 返回行后，名称片段过滤在 Python 侧对结果行做后置判断
+（booking/store.py:91-95）：
+
+    return [
+        {"resource_id": row[0], "name": row[1]}
+        for row in rows
+        if contains is None or contains in row[1]
+    ]
+
+  - --contains 与 --start/--end 同用时取交集：名称不命中的行即使时段
+    空闲也丢弃，时段被占用的行即使名称命中也已在 SQL 阶段被排除；两个
+    条件都满足才返回。
+  - 片段匹配仍是区分大小写的连续子串判断（Python in），不改变顺序、不
+    合并同名行、不改变名称文本。
+  - 每项只构造两个键：resource_id（整数标识）与 name（登记时保存的名称
+    原值）；没有任何行满足时返回空列表 []，属于成功结果。
+
+--------------------------------------------------------------------------------
+5. 阶段四：JSON 输出
+--------------------------------------------------------------------------------
+
+main() 对 resource-list 的处理只有一行分发（booking/__main__.py:368-371）：
+
+    if args.command == "resource-list":
+        return _emit(
+            {"resources": store.list_resources(conn, contains, window)}, 0
+        )
+
+_emit()（booking/__main__.py:63-65）用 json.dumps(..., ensure_ascii=False)
+向标准输出打印恰好一个 JSON 对象并返回退出码。合法时段查询成功时：
+
+  - 退出码 0，标准错误为空；
+  - 顶层只有一个键 resources，值为数组；
+  - 数组每项只有两个键：resource_id（整数）与 name（字符串，保存值原样
+    返回，中文不转义）；
+  - 按 resource_id 数值升序；同名资源分别保留为独立的项，不合并；
+  - 全部资源都被占用（或目录为空、名称片段无命中）时 resources 是空
+    数组 []，仍是退出码 0。
+
+连接在 finally 中关闭（booking/__main__.py:465-466），与业务结果无关。
+每条 python -m booking 命令都是独立进程：重开同一文件再查，读取的是
+持久化后的同一份数据，结果必然相同。
+
+--------------------------------------------------------------------------------
+6. 完整示例（从全新 demo.sqlite 开始）
+--------------------------------------------------------------------------------
+
+以下命令在不含 demo.sqlite 的目录中可完整复现，全部通过公开入口
+python -m booking 调用；每条命令是独立进程，时间统一按固定 UTC+08:00
+解释（与机器时区无关）。
+
+6.1 准备数据：登记两个资源并各预约一段
+
+    python -m booking --db demo.sqlite resource-add --name "一号会议室"
+    预期标准输出（退出码 0，标准错误为空）：
+    {"resource_id": 1, "name": "一号会议室"}
+
+    python -m booking --db demo.sqlite resource-add --name "二号会议室"
+    预期标准输出（退出码 0，标准错误为空）：
+    {"resource_id": 2, "name": "二号会议室"}
+
+    python -m booking --db demo.sqlite reserve --resource 1 \
+        --start 2026-10-05T09:00 --end 2026-10-05T10:00
+    预期标准输出（退出码 0，标准错误为空）：
+    {"booking_id": 1, "resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}
+
+    python -m booking --db demo.sqlite reserve --resource 2 \
+        --start 2026-10-05T10:00 --end 2026-10-05T11:00
+    预期标准输出（退出码 0，标准错误为空）：
+    {"booking_id": 2, "resource_id": 2, "start": "2026-10-05T10:00", "end": "2026-10-05T11:00"}
+
+全新库首批资源标识按 AUTOINCREMENT 依次为 1、2，两条预约标识为 1、2。
+此时资源 1 在 2026-10-05 有未取消预约 09:00-10:00，资源 2 有
+10:00-11:00。
+
+6.2 查询一：10:00 至 11:00 —— 端点相接获准，只返回资源 1
+
+    python -m booking --db demo.sqlite resource-list \
+        --start 2026-10-05T10:00 --end 2026-10-05T11:00
+
+预期标准输出（退出码 0，标准错误为空）：
+
+    {"resources": [{"resource_id": 1, "name": "一号会议室"}]}
+
+逐项判断（对照 4.2 的两个严格不等式，窗口 start=10:00、end=11:00）：
+  - 资源 1 的预约 09:00-10:00：start 09:00 < 11:00 成立，但 end 10:00
+    > 窗口 start 10:00 不成立（取等号）——预约恰在窗口开始时结束，端点
+    相接是零时长交集，不阻挡。资源 1 在整个 [10:00, 11:00) 没有任何
+    占用，故返回。
+  - 资源 2 的预约 10:00-11:00 与窗口完全相同：10:00 < 11:00 与
+    11:00 > 10:00 都成立，存在 60 分钟的正时长交集，资源 2 整体被排除。
+
+6.3 查询二：09:30 至 10:30 —— 两个资源都被排除，返回空数组
+
+    python -m booking --db demo.sqlite resource-list \
+        --start 2026-10-05T09:30 --end 2026-10-05T10:30
+
+预期标准输出（退出码 0，标准错误为空）：
+
+    {"resources": []}
+
+  - 资源 1 的预约 09:00-10:00 与窗口 [09:30, 10:30) 的交集是
+    09:30-10:00，30 分钟正时长（09:00 < 10:30 且 10:00 > 09:30），
+    资源 1 被排除。
+  - 资源 2 的预约 10:00-11:00 与窗口的交集是 10:00-10:30，同样 30 分钟
+    正时长（10:00 < 10:30 且 11:00 > 09:30），资源 2 被排除。注意
+    10:00 处的端点相接只在“一端 start 恰等于另一端 end”时放行；此处
+    10:00 落在窗口内部，交集从 10:00 起持续 30 分钟，故阻挡。
+  - 两个资源都不满足“整个窗口可预约”，结果为空数组；空数组是成功结果，
+    退出码仍为 0。
+
+6.4 重开同一文件：结果相同
+
+再开一个进程重复上述两条查询（或隔任意多次、在任意机器时区下）：
+
+    python -m booking --db demo.sqlite resource-list \
+        --start 2026-10-05T10:00 --end 2026-10-05T11:00
+    python -m booking --db demo.sqlite resource-list \
+        --start 2026-10-05T09:30 --end 2026-10-05T10:30
+
+输出与 6.2、6.3 逐字节相同：时段查询只读业务记录、不消耗标识，数据来自
+demo.sqlite 的持久化内容，所有时间文本都按固定 UTC+08:00 解释。
+
+--------------------------------------------------------------------------------
+7. 可核对的现有测试
+--------------------------------------------------------------------------------
+
+下列用例位于 test_resource_list_availability.py，均通过公开命令行入口
+python -m booking 断言 JSON 内容、退出码与 stderr，可用
+python3 -m unittest test_resource_list_availability -v 复跑（共 25 个
+用例，当前全部通过）：
+
+成功路径——时段筛选语义：
+  - test_window_filters_resources_with_overlapping_bookings
+    本文第 6 节的同一示范：10:00-11:00 只返回资源 1，09:30-10:30 返回
+    []（对应 4.2 与 6.2/6.3）。
+  - test_window_omitted_keeps_full_listing
+    两端点均省略时预约不影响目录（对应 2.1、4.1 的 window is None 路径）。
+  - test_resource_without_bookings_is_returned
+    没有预约的资源在时段查询中返回。
+  - test_touching_endpoints_do_not_block
+    预约结束等于窗口开始、预约开始等于窗口结束，两种端点相接都不阻挡。
+  - test_any_positive_overlap_blocks
+    前段部分重叠、后段部分重叠、包含、被包含、完全相同均排除。
+  - test_cancelled_booking_does_not_occupy
+    取消同时段预约后资源恢复可预约（cancelled = 1 不占用）。
+  - test_resources_are_judged_independently
+    各资源独立判断；test_same_name_resources_are_independent 进一步固定
+    同名资源也各自独立、分别返回。
+  - test_repeat_weeks_bookings_are_ordinary_occupancy
+    重复预约展开为普通预约行：首次与一周后的区间各自相交即排除，中间
+    日期不占用（对应 4.3）。
+  - test_cross_midnight_window_uses_full_datetimes
+    跨午夜窗口与跨日预约按完整日期时间判断（对应 4.3）。
+  - test_past_dates_are_allowed
+    允许过去日期的查询窗口。
+  - test_empty_catalog_returns_empty_list /
+    test_window_on_missing_database_returns_empty_list
+    空目录返回 []；数据库尚不存在时合法查询即初始化文件、返回 [] 且不
+    消耗标识（首个资源标识仍为 1，对应第 3 节）。
+
+成功路径——与 --contains 同用：
+  - test_combined_with_contains_requires_both_conditions
+    名称命中但时段占用、时段空闲但名称不命中都不返回；两条件同时满足才
+    返回，多项时按标识升序（对应 4.4）。
+
+只读与稳定性：
+  - test_window_query_is_read_only
+    查询不增改删业务记录，不消耗资源与预约标识（对应第 3 节）。
+  - test_repeated_queries_and_reopen_are_identical
+    重复查询与独立进程重开同一数据库后结果相同（对应 6.4）。
+
+失败路径——全部为 {"error":"invalid_input"}、退出码 2、stderr 为空：
+  - test_only_one_endpoint_returns_invalid_input（只给一端，对应 2.2）；
+  - test_missing_value_returns_invalid_input（端点缺值）；
+  - test_invalid_date_returns_invalid_input（2 月 30 日等不存在日期）；
+  - test_bad_format_returns_invalid_input（秒、时区后缀、Z、未零填充、
+    分隔符、空格代 T 等，对应 2.3）；
+  - test_non_ascii_digits_return_invalid_input（全角数字及混写，对应
+    2.3 的 ASCII [0-9] 规则）；
+  - test_surrounding_whitespace_returns_invalid_input（首尾空白）；
+  - test_start_must_be_strictly_before_end（相等与颠倒）；
+  - test_invalid_window_does_not_create_database_file
+    非法时段参数指向不存在的路径时文件不被创建（对应 2.5 与第 3 节的
+    先后次序）；
+  - test_invalid_window_does_not_change_existing_database
+    已有库上非法时段失败后，目录与占用情况均不变。
+
+旧库迁移（connect 的共用行为，本文第 3 节）由 test_legacy_db_compat.py
+固定：缺少 cancelled 列的旧库首次打开即自动补齐、已有数据保持有效且不
+被改写；resource-list 打开旧库时走的是同一段 store.connect 代码
+（booking/store.py:34-38）。--contains 的完整用例清单见
+RESOURCE_DIRECTORY_FLOW.txt 第 7 节。
+
+--------------------------------------------------------------------------------
+8. 行为要点汇总
+--------------------------------------------------------------------------------
+
+  - --start 与 --end 可选且必须成对：两个都省略时保留原目录行为
+    （bookings 表不参与）；成对给出时只返回在整个 [start, end) 窗口内
+    都可预约的资源。
+  - 排除规则：同一资源存在未取消预约与窗口有“正时长交集”即排除该资源；
+    左闭右开，端点相接（一端 start 等于另一端 end）不阻挡；部分重叠、
+    包含、被包含、完全相同均阻挡。已取消预约不占用；不同资源（含同名
+    资源）独立判断；跨日窗口与跨日/重复预约一律按完整起止时间比较，
+    重复预约在库中就是各自独立的普通预约行。
+  - 时间文本为固定 UTC+08:00 的严格零填充 YYYY-MM-DDTHH:mm，只接受
+    ASCII 数字，拒绝秒与时区后缀；要求开始严格早于结束，允许过去日期与
+    跨日窗口。
+  - --contains 名称片段语义保持不变；与时段筛选同用时取交集。
+  - 成功输出单个 JSON 对象 {"resources": [...]}：顶层只有 resources，
+    每项只有 resource_id 与 name，按标识数值升序，同名不合并，无匹配
+    （含全部被占用、目录为空、片段无命中）为空数组，退出码 0，标准错误
+    为空。
+  - 只提供一端、端点缺值、非法日期、格式不符、非 ASCII 时间数字、开始
+    不早于结束（以及 --contains 的既有非法输入）：统一输出
+    {"error": "invalid_input"}，退出码 2，标准错误为空，且在打开数据库
+    之前结束——不创建文件、不迁移旧库、不改变任何数据。
+  - 合法查询不改变业务记录、不消耗 AUTOINCREMENT 标识；但打开不存在的
+    数据库会初始化文件，打开缺少 cancelled 列的旧库会沿用既有迁移补齐
+    该列。“查询只读”指业务记录不变，不能理解为绝不写文件。
+  - 其他入口（resource-add、reserve、cancel、reschedule、day-query、
+    free-query）的既有行为不在本文范围，保持不变。
+================================================================================
