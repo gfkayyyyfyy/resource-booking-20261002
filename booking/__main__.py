@@ -242,6 +242,10 @@ def build_parser():
     p_day_query = subparsers.add_parser("day-query")
     p_day_query.add_argument("--resource", required=True)
     p_day_query.add_argument("--date", required=True)
+    # 可选无值开关：结果纳入已取消预约并为每项附加 cancelled 布尔字段；
+    # 缺省只返回未取消预约且不附加状态字段。store_true 不消费下一个参数，
+    # 给开关附加任何值都在解析阶段被拒绝，走统一的 invalid_input。
+    p_day_query.add_argument("--include-cancelled", action="store_true", default=False)
 
     p_free_query = subparsers.add_parser("free-query")
     p_free_query.add_argument("--resource", required=True)
@@ -305,6 +309,9 @@ def main(argv):
             except OverflowError:
                 # 9999-12-31 之后没有可表示的次日，查询上界不设限。
                 day_end = None
+            # --include-cancelled 为无值布尔开关，argparse 已保证其值为
+            # True/False；给开关附加值在解析阶段即被拒绝。
+            include_cancelled = args.include_cancelled
         elif args.command == "free-query":
             resource_id = parse_positive_int(args.resource)
             start, end = parse_time_window(args.start, args.end)
@@ -373,7 +380,7 @@ def main(argv):
             if not store.resource_exists(conn, resource_id):
                 return _emit({"error": "resource_not_found"}, 2)
             bookings = store.query_day_bookings(
-                conn, resource_id, day_start, day_end
+                conn, resource_id, day_start, day_end, include_cancelled
             )
             return _emit(
                 {
