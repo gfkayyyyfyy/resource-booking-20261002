@@ -238,6 +238,10 @@ def build_parser():
     p_list = subparsers.add_parser("resource-list")
     # 可选：只返回保存后的名称包含该片段的资源；缺省返回完整目录。
     p_list.add_argument("--contains", default=None)
+    # 可选且必须成对出现：只返回 [start, end) 内没有任何未取消预约
+    # 相交的资源；两个都省略时不做时段筛选，保留原目录行为。
+    p_list.add_argument("--start", default=None)
+    p_list.add_argument("--end", default=None)
 
     p_day_query = subparsers.add_parser("day-query")
     p_day_query.add_argument("--resource", required=True)
@@ -302,6 +306,16 @@ def main(argv):
                 contains = args.contains.strip()
                 if not contains:
                     raise UsageError("contains must not be empty")
+            # --start 与 --end 必须成对提供：只给一端即非法；成对提供时
+            # 沿用与 reserve/free-query 相同的时间窗口校验（固定
+            # UTC+08:00、严格 YYYY-MM-DDTHH:mm、ASCII 数字、开始严格
+            # 早于结束，允许过去日期与跨日区间）；两个都省略时 window
+            # 保持 None，保留原目录行为。
+            window = None
+            if (args.start is None) != (args.end is None):
+                raise UsageError("--start and --end must be given together")
+            if args.start is not None:
+                window = parse_time_window(args.start, args.end)
         elif args.command == "day-query":
             resource_id = parse_positive_int(args.resource)
             day = parse_date(args.date)
@@ -352,7 +366,9 @@ def main(argv):
             )
 
         if args.command == "resource-list":
-            return _emit({"resources": store.list_resources(conn, contains)}, 0)
+            return _emit(
+                {"resources": store.list_resources(conn, contains, window)}, 0
+            )
 
         if args.command == "cancel":
             if not store.cancel_booking(conn, booking_id):

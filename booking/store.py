@@ -52,7 +52,7 @@ def insert_resource(conn, name):
     return resource_id
 
 
-def list_resources(conn, contains=None):
+def list_resources(conn, contains=None, window=None):
     """返回全部资源，按 resource_id 数值升序。
 
     每项只含 resource_id 与 name；name 为登记时保存的原值，
@@ -62,10 +62,32 @@ def list_resources(conn, contains=None):
     连续子串比较，百分号、下划线等一律按普通字符处理，不做通配、
     正则或字符归一化。在 Python 侧用 in 判断而非 SQL LIKE，
     从机制上保证片段里没有字符会被当作通配符。
+
+    window 不为 None 时为 (start, end) 定宽文本对：只返回在该
+    左闭右开区间内没有任何未取消预约相交的资源（与 has_conflict
+    同一条相交规则：端点相接不算重叠，已取消预约不占用，各资源
+    独立判断）；没有预约的资源自然入选。contains 与 window 同时
+    给出时，名称与时段两个条件都满足才返回。
     """
-    rows = conn.execute(
-        "SELECT id, name FROM resources ORDER BY id ASC"
-    ).fetchall()
+    if window is None:
+        rows = conn.execute(
+            "SELECT id, name FROM resources ORDER BY id ASC"
+        ).fetchall()
+    else:
+        start, end = window
+        rows = conn.execute(
+            """
+            SELECT id, name FROM resources
+            WHERE NOT EXISTS (
+                SELECT 1 FROM bookings
+                WHERE bookings.resource_id = resources.id
+                  AND cancelled = 0
+                  AND start < ? AND end > ?
+            )
+            ORDER BY id ASC
+            """,
+            (end, start),
+        ).fetchall()
     return [
         {"resource_id": row[0], "name": row[1]}
         for row in rows
