@@ -73,6 +73,37 @@ def list_resources(conn, contains=None):
     ]
 
 
+def list_available_resources(conn, contains, start, end):
+    """返回在 [start, end) 全程可预约的资源，按 resource_id 数值升序。
+
+    资源上有任意未取消预约与该窗口相交（左闭右开：预约 end 等于窗口
+    start、预约 start 等于窗口 end 都不算相交，任何正时长重叠都排除）
+    即被排除；已取消预约不占用，没有预约的资源可返回，各资源独立判断。
+    每项只含 resource_id 与 name；同名资源各自独立保留。
+    contains 的匹配规则与 list_resources 完全相同（Python 侧区分大小写
+    的连续子串判断，% 与 _ 按普通字符处理）；不为 None 时名称与时段
+    两个条件同时满足才返回。只读查询，不写入任何记录、不消耗标识。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, name FROM resources
+        WHERE NOT EXISTS (
+            SELECT 1 FROM bookings
+            WHERE bookings.resource_id = resources.id
+              AND bookings.cancelled = 0
+              AND bookings.start < ? AND bookings.end > ?
+        )
+        ORDER BY id ASC
+        """,
+        (end, start),
+    ).fetchall()
+    return [
+        {"resource_id": row[0], "name": row[1]}
+        for row in rows
+        if contains is None or contains in row[1]
+    ]
+
+
 def resource_exists(conn, resource_id):
     row = conn.execute(
         "SELECT 1 FROM resources WHERE id = ?", (resource_id,)
