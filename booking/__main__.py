@@ -235,6 +235,10 @@ def build_parser():
     # 改期只作用于指定的一条预约，不提供 --repeat-weeks：每周重复预约
     # 在库中各自独立，改期只改这一项，其他各项不受影响。
 
+    p_rename = subparsers.add_parser("resource-rename")
+    p_rename.add_argument("--resource", required=True)
+    p_rename.add_argument("--name", required=True)
+
     p_list = subparsers.add_parser("resource-list")
     # 可选：只返回保存后的名称包含该片段的资源；缺省返回完整目录。
     p_list.add_argument("--contains", default=None)
@@ -298,6 +302,14 @@ def main(argv):
             # reserve/free-query 完全一致，允许过去日期与跨日区间。
             booking_id = parse_positive_int(args.booking)
             start, end = parse_time_window(args.start, args.end)
+        elif args.command == "resource-rename":
+            # 标识与名称的校验先于打开数据库：非法输入不建文件、不迁移
+            # 旧库、不改数据。名称沿用登记规则：去除首尾空白，内部空白、
+            # 大小写及中文保持原样；空文本或纯空白一律非法。
+            resource_id = parse_positive_int(args.resource)
+            name = args.name.strip()
+            if not name:
+                raise UsageError("name must not be empty")
         elif args.command == "resource-list":
             # --contains 去除首尾空白后参与匹配（中间空格保留）；
             # 缺省为 None 表示不筛选，空文本或纯空白一律非法。
@@ -352,7 +364,8 @@ def main(argv):
         # SQLite（否则会抛 OverflowError）。此时连接已正常打开，因此合法输入
         # 原有的建库初始化与旧库兼容行为保持不变；invalid_input 已在连接前
         # 返回，优先级不受影响。
-        if args.command in ("reserve", "day-query", "free-query"):
+        if args.command in ("reserve", "day-query", "free-query",
+                            "resource-rename"):
             if resource_id is OVERSIZED_ID:
                 return _emit({"error": "resource_not_found"}, 2)
         elif args.command in ("cancel", "reschedule"):
@@ -369,6 +382,12 @@ def main(argv):
             return _emit(
                 {"resources": store.list_resources(conn, contains, window)}, 0
             )
+
+        if args.command == "resource-rename":
+            if not store.rename_resource(conn, resource_id, name):
+                return _emit({"error": "resource_not_found"}, 2)
+            # 成功只回显两个字段：标识保持原值，名称为保存后的文本。
+            return _emit({"resource_id": resource_id, "name": name}, 0)
 
         if args.command == "cancel":
             if not store.cancel_booking(conn, booking_id):

@@ -1,0 +1,199 @@
+================================================================================
+resource-rename 单个资源改名流程说明
+================================================================================
+
+本文描述一次资源改名（resource-rename）从命令行输入到 JSON 输出的完整
+流程，全部结论均可对照源码核实。涉及文件只有两个：
+
+  booking/__main__.py   命令行入口、参数解析与校验、错误输出
+  booking/store.py      SQLite 持久化层、资源名称更新
+
+本文只描述 resource-rename 的行为；其他入口（resource-add、resource-list、
+reserve、cancel、reschedule、day-query、free-query）的行为均不在本文
+范围，保持不变。
+
+--------------------------------------------------------------------------------
+1. 总体流程概览
+--------------------------------------------------------------------------------
+
+一次 resource-rename 依次经过四个阶段，顺序固定：
+
+  (1) 参数解析与输入校验   booking/__main__.py: main() 前半段
+                           （resource-rename 分支）
+  (2) 打开数据库           booking/store.py: connect()
+  (3) 事务内改名           booking/store.py: rename_resource()
+  (4) 结果输出             booking/__main__.py: main() 的
+                           resource-rename 分支，经由 _emit()
+
+关键次序：阶段 (1) 的任何失败都在阶段 (2) 之前返回，因此非法输入不会创建
+数据库文件、不会迁移旧库、不会改动任何记录。输入合法性优先于资源存在性：
+不存在的标识搭配空名称仍返回 invalid_input。
+
+--------------------------------------------------------------------------------
+2. 阶段一：参数解析与输入校验
+--------------------------------------------------------------------------------
+
+2.1 命令行形状
+
+resource-rename 接受两个必填参数（booking/__main__.py 的 build_parser）：
+
+    p_rename = subparsers.add_parser("resource-rename")
+    p_rename.add_argument("--resource", required=True)
+    p_rename.add_argument("--name", required=True)
+
+  - --db 为全局必填参数，值为 SQLite 文件路径。
+  - 缺少 --resource 或 --name、出现不支持的参数（如 --bogus），argparse
+    报错并经 _Parser.error 转为 UsageError，与值校验失败走同一路径。
+
+2.2 标识与名称的校验
+
+main() 的 resource-rename 分支：
+
+    elif args.command == "resource-rename":
+        resource_id = parse_positive_int(args.resource)
+        name = args.name.strip()
+        if not name:
+            raise UsageError("name must not be empty")
+
+  - --resource 沿用与其他入口共用的正整数文本规则 parse_positive_int：
+    允许任意数量前导零（按数值解释，"0001" 即 1）、允许 Unicode 十进制
+    数字（如全角 "２" 即 2），不裁剪空白——首尾或数字中间含空格、制表
+    符、换行一律非法；零（含 "000"）、负数、小数、含非数字字符的文本
+    一律非法。超过 2^63-1 的正整数是合法输入，返回 OVERSIZED_ID 标记，
+    在阶段三之前按“标识不存在”短路（见第 3 节）。
+  - --name 沿用登记（resource-add）的名称规则：str.strip() 去除首尾
+    空白，内部空白、大小写及中文保持原样；空文本或纯空白（strip 后为
+    空）一律非法。
+  - 两项校验都在打开数据库之前完成，故非法输入不建文件、不迁移旧库、
+    不改数据；合法性优先于存在性——不存在的标识（含超大标识）搭配
+    空名称，仍只返回 invalid_input。
+
+2.3 校验失败的统一出口
+
+上述各类情况统一输出：
+
+    {"error": "invalid_input"}
+
+退出码为 2，标准错误为空；不区分错误文案，输出完全相同。
+
+--------------------------------------------------------------------------------
+3. 阶段二：打开数据库与超大标识短路
+--------------------------------------------------------------------------------
+
+输入全部合法后才调用 store.connect(args.db)：
+
+  - 文件不存在时沿用既有初始化行为创建文件并建表；缺少 cancelled 列的
+    旧库沿用既有迁移补齐该列。因此对一个不存在的路径执行合法的
+    resource-rename，会先初始化数据库，随后返回 resource_not_found。
+  - 超过 2^63-1 的正整数标识（OVERSIZED_ID）在连接打开后、发起任何
+    查询前短路返回 {"error": "resource_not_found"}：真实标识不可能
+    超过 SQLite INTEGER 上限，超大整数绝不绑定给 SQLite。
+
+--------------------------------------------------------------------------------
+4. 阶段三：事务内改名 rename_resource（booking/store.py）
+--------------------------------------------------------------------------------
+
+    conn.execute("BEGIN IMMEDIATE")
+    cur = conn.execute(
+        "UPDATE resources SET name = ? WHERE id = ?",
+        (name, resource_id),
+    )
+    if cur.rowcount == 0:
+        conn.rollback()
+        return False
+    conn.commit()
+    return True
+
+  - 在 BEGIN IMMEDIATE 事务内按主键更新单行：资源不存在（rowcount 为
+    0）时回滚并返回 False，不改动任何记录；存在时提交并返回 True。
+  - 只更新该行的 name：不新增资源、不消耗资源或预约的 AUTOINCREMENT
+    标识，不改变其他资源的名称，也不改变任何预约的资源归属、起止时间
+    与取消状态。改名后资源继续沿用原标识与原预约。
+  - 名称不做唯一性检查：允许改成与其他资源相同的名称（与 resource-add
+    允许同名登记一致），也允许新旧名称相同，均视为成功。
+  - 目录筛选（resource-list --contains）与整段空闲筛选
+    （resource-list --start/--end）读取的是保存后的名称与原预约，
+    改名后立即使用新名称，空闲判断仍由原预约决定；重新打开同一数据库
+    后结果一致。
+
+--------------------------------------------------------------------------------
+5. 阶段四：结果输出
+--------------------------------------------------------------------------------
+
+  - 成功：{"resource_id": <原数值标识>, "name": "<保存后的名称>"}，
+    退出码 0，标准输出仅此一个 JSON 对象，标准错误为空。resource_id
+    为解析后的数值（前导零、Unicode 数字已按数值归一），name 为去除
+    首尾空白后的保存值。
+  - 资源不存在（含超大标识）：{"error": "resource_not_found"}，
+    退出码 2，标准错误为空。
+  - 输入非法：{"error": "invalid_input"}，退出码 2，标准错误为空，
+    且在打开数据库之前返回。
+
+--------------------------------------------------------------------------------
+6. 完整示例（验收场景）
+--------------------------------------------------------------------------------
+
+在全新 demo.sqlite 上依次执行：
+
+    python -m booking --db demo.sqlite resource-add --name "一号会议室"
+    # {"resource_id": 1, "name": "一号会议室"}
+    python -m booking --db demo.sqlite resource-add --name "二号会议室"
+    # {"resource_id": 2, "name": "二号会议室"}
+    python -m booking --db demo.sqlite reserve --resource 1 \
+        --start 2026-10-05T09:00 --end 2026-10-05T10:00
+    # {"booking_id": 1, "resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}
+
+    python -m booking --db demo.sqlite resource-rename --resource 0001 \
+        --name "  二号会议室  "
+    # {"resource_id": 1, "name": "二号会议室"}   （退出码 0，stderr 为空）
+
+    python -m booking --db demo.sqlite resource-list --contains 二号会议室
+    # {"resources": [{"resource_id": 1, "name": "二号会议室"}, {"resource_id": 2, "name": "二号会议室"}]}
+
+    python -m booking --db demo.sqlite resource-list \
+        --start 2026-10-05T00:00 --end 2026-10-05T23:59
+    # {"resources": [{"resource_id": 2, "name": "二号会议室"}]}
+    # （整段空闲筛选仍由资源 1 的 09:00–10:00 预约决定）
+
+--------------------------------------------------------------------------------
+7. 可核对的现有测试
+--------------------------------------------------------------------------------
+
+test_resource_rename.py 通过公开命令行入口断言上述行为，可用
+python3 -m unittest test_resource_rename -v 复跑：
+
+  - test_acceptance_rename_and_filter_by_new_name
+    验收场景：0001 改名为“二号会议室”，目录筛选立即使用新名称并按
+    原标识顺序返回，整段空闲筛选仍由原预约决定，预约归属与起止不变。
+  - test_rename_to_same_name_succeeds / test_rename_unicode_digit_and_leading_zero_id
+    名称不变也成功；前导零与 Unicode 十进制数字按数值解释。
+  - test_rename_strips_blank_keeps_inner_space_case_and_cjk
+    新名称去首尾空白，内部空白、大小写及中文保持原样。
+  - test_rename_only_touches_target_resource / test_rename_does_not_consume_ids
+    / test_rename_does_not_change_cancelled_state
+    只改指定标识，不消耗标识，不影响其他资源与任何预约。
+  - test_unknown_resource_returns_not_found / test_oversized_id_returns_not_found
+    / test_valid_request_on_missing_db_initializes_then_not_found
+    不存在与超大标识返回 resource_not_found；合法请求在未建库路径上
+    先初始化再返回 resource_not_found。
+  - test_missing_arguments_return_invalid_input 等 invalid_input 用例
+    缺参、未知参数、空/纯空白名称、零/负数/小数/含非数字字符的标识
+    统一 invalid_input；合法性优先于存在性；非法输入不建库、不改数据。
+
+--------------------------------------------------------------------------------
+8. 行为要点汇总
+--------------------------------------------------------------------------------
+
+  - resource-rename --resource <标识> --name <新名称>：把指定资源改名，
+    资源继续沿用原标识与原预约；允许改成其他资源的名称，也允许名称不变。
+  - 新名称沿用登记规则：去除首尾空白，内部空白、大小写及中文保持原样。
+  - 成功返回只含 resource_id 与 name 的 JSON 对象，退出码 0。
+  - 缺参、未知参数、名称为空或仅为空白、零/负数/小数/含非数字字符的
+    标识统一 {"error": "invalid_input"}；资源不存在或标识超过 2^63-1
+    返回 {"error": "resource_not_found"}；输入合法性优先。失败一律
+    退出码 2、标准错误为空，且不改动已有资源和预约。
+  - 非法输入不新建数据库文件或迁移旧库；合法请求访问未建库路径沿用
+    现有初始化行为，随后返回 resource_not_found。
+  - 其他入口的既有输入输出与固定 UTC+08:00 下的冲突规则保持不变，
+    已有 SQLite 数据继续兼容。
+================================================================================

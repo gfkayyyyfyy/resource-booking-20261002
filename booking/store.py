@@ -102,6 +102,30 @@ def resource_exists(conn, resource_id):
     return row is not None
 
 
+def rename_resource(conn, resource_id, name):
+    """在事务内把指定资源的名称改为 name，保留原标识与全部预约。
+
+    资源不存在返回 False（不改动任何记录）；改名成功返回 True。
+    只更新该行的 name：不新增资源、不消耗资源或预约标识，不改变其他
+    资源的名称，也不改变任何预约的资源归属、起止时间与取消状态。
+    允许改成与其他资源相同的名称，也允许新旧名称相同，均视为成功。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "UPDATE resources SET name = ? WHERE id = ?",
+            (name, resource_id),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
+
+
 # 同资源时段冲突规则只维护这一份：只有同一资源的未取消预约与
 # [start, end) 相交（左闭右开，端点相接不冲突）才算阻挡。
 # 创建（insert_bookings/insert_booking）与改期（reschedule_booking）
