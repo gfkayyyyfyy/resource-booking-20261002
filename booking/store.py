@@ -182,19 +182,34 @@ def reschedule_booking(conn, booking_id, start, end):
     return resource_id, None
 
 
-def query_day_bookings(conn, resource_id, day_start, day_end):
-    """返回指定资源上与 [day_start, day_end) 相交的未取消预约。
+def query_day_bookings(conn, resource_id, day_start, day_end,
+                       include_cancelled=False):
+    """返回指定资源上与 [day_start, day_end) 相交的预约。
 
     时间为定宽文本，字典序即时间先后；起止时间原样返回，不截断跨日
     预约。左闭右开：end == day_start 或 start == day_end 的预约均不含。
     day_end 为 None 时表示不设上界（9999-12-31 的次日无法用日期表示）。
     只读查询，不写入任何记录。
+
+    include_cancelled 为 False（缺省）时只返回未取消预约，每项只含
+    booking_id、start、end 三个字段，与开关上线前的结果完全一致；
+    为 True 时纳入已取消记录，排序规则不变（不把取消记录排到末尾），
+    每项仅在原字段之外额外返回 cancelled 布尔值（未取消为 False，
+    已取消为 True）。两个插值片段只可能取本函数内的固定文本，不含
+    任何外部输入。
     """
+    if include_cancelled:
+        selected_columns = "id, start, end, cancelled"
+        cancelled_filter = ""
+    else:
+        selected_columns = "id, start, end"
+        cancelled_filter = "AND cancelled = 0"
     if day_end is None:
         rows = conn.execute(
-            """
-            SELECT id, start, end FROM bookings
-            WHERE resource_id = ? AND cancelled = 0
+            f"""
+            SELECT {selected_columns} FROM bookings
+            WHERE resource_id = ?
+              {cancelled_filter}
               AND end > ?
             ORDER BY start ASC, id ASC
             """,
@@ -202,18 +217,22 @@ def query_day_bookings(conn, resource_id, day_start, day_end):
         ).fetchall()
     else:
         rows = conn.execute(
-            """
-            SELECT id, start, end FROM bookings
-            WHERE resource_id = ? AND cancelled = 0
+            f"""
+            SELECT {selected_columns} FROM bookings
+            WHERE resource_id = ?
+              {cancelled_filter}
               AND start < ? AND end > ?
             ORDER BY start ASC, id ASC
             """,
             (resource_id, day_end, day_start),
         ).fetchall()
-    return [
-        {"booking_id": row[0], "start": row[1], "end": row[2]}
-        for row in rows
-    ]
+    bookings = []
+    for row in rows:
+        item = {"booking_id": row[0], "start": row[1], "end": row[2]}
+        if include_cancelled:
+            item["cancelled"] = bool(row[3])
+        bookings.append(item)
+    return bookings
 
 
 def query_free_slots(conn, resource_id, start, end, min_minutes=None,

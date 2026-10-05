@@ -105,15 +105,17 @@ reschedule --booking <booking_id> --start <新开始时间> --end <新结束时�
 ### day-query —— 按日查询预约
 
 ```
-day-query --resource <resource_id> --date <YYYY-MM-DD>
+day-query --resource <resource_id> --date <YYYY-MM-DD> [--include-cancelled]
 ```
 
 - 查询指定资源在某个本地日期（固定 UTC+08:00，当天 `00:00` 至次日 `00:00`，左闭右开）内有实际交集的全部**未取消**预约；查询为只读操作，不新增或改动记录，也不消耗预约标识。
 - 只要预约区间与查询日 `[当天 00:00, 次日 00:00)` 相交即返回，跨日预约只出现一次并保留完整起止时间，不做截断；结束于当天 `00:00`、或开始于次日 `00:00` 的预约不属于该日。
 - 成功返回：`{"resource_id": <正整数>, "date": "<YYYY-MM-DD>", "bookings": [...]}`，`bookings` 每项为 `{"booking_id": ..., "start": "...", "end": "..."}`（时间为原预约文本），按 `start` 升序、相同时按 `booking_id` 升序排列；资源存在但没有匹配预约时为空数组。
-- 资源不存在时返回 `{"error": "resource_not_found"}`；其他资源的预约不会出现在结果中。
+- 可选无值开关 `--include-cancelled`：省略时筛选、字段与排序与不带该开关的查询完全一致，不返回任何状态字段；提供时 `bookings` 额外纳入已取消记录，顶层字段不变，每项仅在原字段之外增加 `cancelled` 布尔字段（未取消为 `false`，已取消为 `true`）。取消记录不单独排在末尾：全部记录仍按 `start` 升序、相同时按 `booking_id` 数值升序排列；取消后重订同一时段的记录各自独立返回，不与旧记录合并。
+- `--include-cancelled` 不接受任何值：`--include-cancelled true`、`--include-cancelled=1` 等给开关附加值的写法统一返回 `{"error": "invalid_input"}`（退出码 2，标准错误为空）；该校验与日期、标识校验一样先于资源存在性检查，非法输入不新建文件、不迁移旧库、不改动已有数据。
+- 资源不存在时返回 `{"error": "resource_not_found"}`（含大于 2^63-1 的正整数标识）；其他资源的预约不会出现在结果中。
 - 日期必须为严格零填充的 `YYYY-MM-DD` 且为有效日期（如 `2026-02-30` 非法），数字位只接受 ASCII `0`–`9`（全角、阿拉伯文数字及其混写一律拒绝），否则返回 `{"error": "invalid_input"}`；非法输入不会新建数据库文件。
-- 取消结果对查询立即生效并持久化：预约取消后无论是否重新打开数据库，都不再出现在查询结果中。
+- 取消结果对查询立即生效并持久化：预约取消后无论是否重新打开数据库，缺省查询都不再返回该记录；只有显式提供 `--include-cancelled` 时才会以 `cancelled: true` 出现。
 
 ### free-query —— 空闲时段查询
 

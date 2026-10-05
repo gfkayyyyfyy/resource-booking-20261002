@@ -242,6 +242,13 @@ def build_parser():
     p_day_query = subparsers.add_parser("day-query")
     p_day_query.add_argument("--resource", required=True)
     p_day_query.add_argument("--date", required=True)
+    # 可选无值开关：纳入已取消预约并为每项返回 cancelled 布尔值；
+    # 缺省时筛选、字段与排序与既有结果完全一致。store_true 不消费下
+    # 一个参数，故 --include-cancelled 后追加任何值都会被 argparse 按
+    # 未知位置参数/显式赋值拒绝，走统一的 invalid_input。
+    p_day_query.add_argument(
+        "--include-cancelled", action="store_true", default=False
+    )
 
     p_free_query = subparsers.add_parser("free-query")
     p_free_query.add_argument("--resource", required=True)
@@ -298,6 +305,10 @@ def main(argv):
         elif args.command == "day-query":
             resource_id = parse_positive_int(args.resource)
             day = parse_date(args.date)
+            # --include-cancelled 为无值布尔开关，argparse 已保证其值为
+            # True/False；给开关附加值（--include-cancelled x、
+            # --include-cancelled=true）在解析阶段即拒绝。
+            include_cancelled = args.include_cancelled
             day_start = f"{args.date}T00:00"
             try:
                 next_day = day + datetime.timedelta(days=1)
@@ -373,7 +384,7 @@ def main(argv):
             if not store.resource_exists(conn, resource_id):
                 return _emit({"error": "resource_not_found"}, 2)
             bookings = store.query_day_bookings(
-                conn, resource_id, day_start, day_end
+                conn, resource_id, day_start, day_end, include_cancelled
             )
             return _emit(
                 {
