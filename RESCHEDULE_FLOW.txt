@@ -1,0 +1,466 @@
+================================================================================
+reschedule 单条预约改期流程说明
+================================================================================
+
+本文描述一次单条预约改期（reschedule）从命令行输入到 JSON 输出的完整
+流程，全部结论均可对照源码核实。涉及文件只有两个：
+
+  booking/__main__.py   命令行入口、参数解析与校验、错误输出
+  booking/store.py      SQLite 持久化层、目标查找、冲突判断、事务更新
+
+本文只描述既有行为，不改动任何产品代码、公开命令、输出协议、既有测试、
+数据库格式或其他公开入口（resource-add / reserve / cancel / resource-list /
+day-query / free-query）的行为。
+
+--------------------------------------------------------------------------------
+1. 总体流程概览
+--------------------------------------------------------------------------------
+
+一次 reschedule 依次经过五个阶段，顺序固定：
+
+  (1) 参数解析与输入校验   booking/__main__.py: main() 前半段
+                           （reschedule 分支，290-296 行）
+  (2) 打开数据库           booking/store.py: connect()（22-39 行）
+  (3) 超大标识短路         booking/__main__.py: main()（344-346 行）
+  (4) 事务内目标查找、     booking/store.py: reschedule_booking()（145-182 行）
+      冲突判断与更新       （SELECT 目标行 → has_conflict → UPDATE）
+  (5) JSON 输出            booking/__main__.py: main() 的 reschedule 分支
+                           （362-381 行）
+
+关键次序一：阶段 (1) 的任何失败都在阶段 (2) 之前返回，因此非法输入不会
+创建数据库文件、不会迁移旧库、不会改动任何记录。这一点由 main() 的结构
+保证——全部校验放在 try 块内、connect 之前（booking/__main__.py:271-334）：
+
+    # 先解析参数并完成全部输入校验，之后才连接/初始化数据库，
+    # 保证非法输入不会新建文件或改动任何记录。
+    try:
+        args = parser.parse_args(argv)
+        ...
+        elif args.command == "reschedule":
+            booking_id = parse_positive_int(args.booking)
+            start, end = parse_time_window(args.start, args.end)
+        ...
+    except UsageError:
+        return invalid_input()
+
+    # 输入合法后再打开数据库（不存在则初始化），后续进程沿用同一文件。
+    conn = store.connect(args.db)
+
+关键次序二：阶段 (4) 的“查找目标 → 冲突判断 → 更新”在同一个
+BEGIN IMMEDIATE 事务内顺序执行（booking/store.py:160-178），冲突时在
+UPDATE 语句执行之前就 rollback 返回——这就是冲突后原时段保持不变的
+实现位置（详见第 6 节）。
+
+检查优先级整体为：先输入合法性（invalid_input），再预约是否存在
+（booking_not_found），最后冲突判断（booking_conflict）。
+
+--------------------------------------------------------------------------------
+2. 阶段一：参数解析与输入校验
+--------------------------------------------------------------------------------
+
+2.1 命令行形状
+
+reschedule 只接受三个必填参数（booking/__main__.py:231-236）：
+
+    p_reschedule = subparsers.add_parser("reschedule")
+    p_reschedule.add_argument("--booking", required=True)
+    p_reschedule.add_argument("--start", required=True)
+    p_reschedule.add_argument("--end", required=True)
+    # 改期只作用于指定的一条预约，不提供 --repeat-weeks：每周重复预约
+    # 在库中各自独立，改期只改这一项，其他各项不受影响。
+
+  - 缺少 --booking / --start / --end 中任何一个，argparse 直接报错。
+  - 子解析器没有定义 --repeat-weeks、--resource 等其他参数，因此
+    “reschedule ... --repeat-weeks 2”“... --resource 1”等携带不支持
+    参数的写法，由 argparse 按未知参数拒绝。
+  - argparse 本身的报错被自定义解析器 _Parser.error 转成 UsageError
+    （booking/__main__.py:56-60），与值校验失败走同一路径，argparse
+    不会自己向 stderr 输出文本。
+
+2.2 预约标识：parse_positive_int（booking/__main__.py:72-94）
+
+  - 只接受纯数字文本（允许前导零），正则 POSITIVE_INT_RE = ^\d+\Z
+    （booking/__main__.py:29）。\Z 锚定绝对结尾："1\n"、首尾空白、
+    制表符、负号、小数点一律拒绝，不自动去除任何空白。
+  - 纯零（"0"、"000"）不是正整数，拒绝；负数、小数、非整数文本同样
+    拒绝。
+  - 数值在 [1, 2^63-1] 内返回 int；超过 SQLite INTEGER 上限的正整数
+    返回哨兵 OVERSIZED_ID（booking/__main__.py:44-49）。它是合法输入，
+    留到阶段 (3) 按“标识不存在”处理，绝不绑定给 SQLite（否则会抛
+    OverflowError）。
+
+2.3 时间窗口：parse_time_window（booking/__main__.py:153-167）
+
+    def parse_time_window(start_text, end_text):
+        start_dt = parse_time(start_text)
+        end_dt = parse_time(end_text)
+        if not start_dt < end_dt:
+            raise UsageError("start must be strictly before end")
+        return start_text, end_text
+
+  - parse_time（booking/__main__.py:142-150）要求严格的定宽格式
+    YYYY-MM-DDTHH:mm，正则
+    ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$（TIME_RE，
+    booking/__main__.py:22）：拒绝秒（10:00:00）、时区后缀（Z /
+    +08:00）、非零填充（T1000）、首尾空白；数字位只接受 ASCII 0-9，
+    全角数字（２０２６）等一律拒绝；不存在的日期（2026-02-30）由
+    strptime 抛 ValueError 转为 UsageError。
+  - 解析成功后统一附加固定时区 UTC+08:00（TIMEZONE_OFFSET，
+    booking/__main__.py:16），不随运行环境时区变化，分钟精度。
+  - 唯一的关系约束是 start 严格早于 end：起止相等、起止倒置都不合法；
+    允许过去日期，也允许跨日区间（如 2026-10-05T23:00 至
+    2026-10-06T01:00）。
+  - 校验通过时返回的是原始文本而不是 datetime：定宽文本的字典序即
+    时间先后，存储层直接按文本比较，成功结果也原样回显输入文本。
+
+2.4 校验失败的统一出口
+
+任何 UsageError 都走到（booking/__main__.py:330-331）：
+
+    except UsageError:
+        return invalid_input()
+
+invalid_input()（booking/__main__.py:68-69）经 _emit（63-65 行）在
+标准输出打印唯一的 JSON 对象 {"error": "invalid_input"}，退出码 2，
+标准错误为空。缺参、非法标识、非法时间、起止顺序错误、携带不支持的
+参数不加区分，全部是这一种输出；且整个阶段发生在 store.connect 之前，
+因此非法输入：
+
+  - 不新建数据库文件（路径不存在时也保持不存在）；
+  - 不触发旧库迁移；
+  - 不改动任何已有数据。
+
+--------------------------------------------------------------------------------
+3. 阶段二：打开数据库（store.connect，booking/store.py:22-39）
+--------------------------------------------------------------------------------
+
+全部输入合法后才调用 store.connect(args.db)：
+
+  - sqlite3.connect 打开文件；文件不存在时创建，并 executescript(SCHEMA)
+    建表（resources / bookings，均 CREATE TABLE IF NOT EXISTS，
+    booking/store.py:6-19）。
+  - 对取消功能上线前创建的旧库，若 bookings 表缺少 cancelled 列，则
+    ALTER TABLE 补齐，已有记录一律视为未取消（DEFAULT 0，34-38 行）。
+  - 连接置于 autocommit 模式（isolation_level = None）、启用外键；
+    事务由业务函数显式用 BEGIN IMMEDIATE 管理。
+
+需要区分两类“写”：改期成功时当然会更新业务数据；但即使是最终不改任何
+预约的合法请求（例如 booking_not_found、booking_conflict），打开数据库
+这一步本身也可能初始化新文件或补齐旧库的 cancelled 列。因此准确的说法
+是“失败结果不改动任何预约记录”，而不能概括为“绝不写文件”。非法输入
+则连这一步都不会到达（第 2.4 节）。
+
+--------------------------------------------------------------------------------
+4. 阶段三：超大标识短路（booking/__main__.py:344-346）
+--------------------------------------------------------------------------------
+
+连接打开后、发起任何 SQL 查询前，先处理超大标识：
+
+    elif args.command in ("cancel", "reschedule"):
+        if booking_id is OVERSIZED_ID:
+            return _emit({"error": "booking_not_found"}, 2)
+
+任何真实预约标识都由 SQLite INTEGER 主键分配，不可能超过 2^63-1
+（SCHEMA 中 bookings.id 为 INTEGER PRIMARY KEY AUTOINCREMENT，
+booking/store.py:11-12）。故大于该值的正整数（如 9223372036854775808，
+无论带多少前导零）作为合法输入直接按“不存在”短路，输出
+{"error": "booking_not_found"}，退出码 2，绝不绑定给 SQLite。边界值
+2^63-1 本身不是 OVERSIZED_ID，会进入阶段 (4) 走普通主键查询，查不到
+时同样得到 booking_not_found。
+
+--------------------------------------------------------------------------------
+5. 阶段四：事务内查找目标、冲突判断与更新
+--------------------------------------------------------------------------------
+
+全部逻辑集中在 store.reschedule_booking(conn, booking_id, start, end)
+（booking/store.py:145-182），由 main() 在 reschedule 分支调用
+（booking/__main__.py:362-365）。函数返回 (resource_id, error)：
+成功为 (资源标识, None)，失败为 (None, "booking_not_found") 或
+(None, "booking_conflict")。
+
+5.1 开启事务与目标查找（booking/store.py:160-170）
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT resource_id, cancelled FROM bookings WHERE id = ?",
+            (booking_id,),
+        ).fetchone()
+        if row is None or row[1] != 0:
+            # 不存在与已取消统一视为找不到；已取消预约不能借改期恢复。
+            conn.rollback()
+            return None, "booking_not_found"
+        resource_id = row[0]
+
+  - BEGIN IMMEDIATE 立即取得保留锁，检查与后续更新在同一事务内完成，
+    多进程下不会出现两个进程同时通过冲突检查的中间态。
+  - 按主键只取目标行的 resource_id 与 cancelled 两列：
+      * 查不到行（row is None）：预约不存在 → rollback 后返回
+        booking_not_found；
+      * cancelled != 0：预约已取消 → 同样返回 booking_not_found。
+        已取消记录不能通过改期恢复，分支里没有任何 UPDATE，取消状态
+        原封不动（随后对该标识再次 cancel 仍是 booking_not_found）。
+  - 资源归属直接取自目标行（resource_id = row[0]），改期不接收、也
+    不修改资源归属，因此不存在单独的“资源是否存在”检查。
+
+5.2 冲突判断：为什么目标预约自身不阻挡改期
+
+    if has_conflict(conn, resource_id, start, end, exclude_id=booking_id):
+        conn.rollback()
+        return None, "booking_conflict"
+
+冲突规则创建与改期共用同一份实现 has_conflict
+（booking/store.py:98-120），SQL 片段在 90-95 行：
+
+    _CONFLICT_EXISTS_SQL = """
+    SELECT 1 FROM bookings
+    WHERE resource_id = :resource_id AND cancelled = 0
+      AND start < :window_end AND end > :window_start
+    """
+    _CONFLICT_EXISTS_EXCLUDE_SQL = _CONFLICT_EXISTS_SQL + "  AND id != :exclude_id\n"
+
+has_conflict 在 exclude_id 不为 None 时拼接 AND id != :exclude_id
+（booking/store.py:116-118）。reschedule 固定传入 exclude_id=booking_id，
+所以：
+
+  - 目标行在 SQL 层就被 id != :exclude_id 排除，冲突集合只包含同一资源
+    的“其他”预约。即使新时段与目标行自己的旧时段重叠，甚至新旧时段
+    完全相同（改期到原时段），目标行也不会与自己相撞——这就是“目标
+    预约自身不阻挡改期”的依据，是显式排除，而非巧合。
+  - 其余条件与创建预约完全一致：
+      * resource_id = :resource_id：只比较同一资源，其他资源的预约
+        不阻挡；
+      * cancelled = 0：只比较未取消预约，已取消预约不阻挡；
+      * start < :window_end AND end > :window_start：左闭右开
+        [start, end) 的相交条件。端点相接（一端 start 等于另一端
+        end）时两个严格比较必有一个不成立，不算冲突；部分重叠、完全
+        相同、包含或被包含都判定冲突。
+  - 时间以定宽文本存储，字典序即时间先后，文本比较与时间比较等价。
+
+5.3 更新与提交（booking/store.py:174-182）
+
+    conn.execute(
+        "UPDATE bookings SET start = ?, end = ? WHERE id = ?",
+        (start, end, booking_id),
+    )
+    conn.commit()
+    ...
+    return resource_id, None
+
+  - 冲突检查通过后，全函数唯一的写操作是按主键 UPDATE 该行的 start、
+    end 两列；WHERE id = ? 决定最多影响一行。
+  - 不执行 INSERT：不新增任何预约行，bookings 表行数不变；SQLite 的
+    AUTOINCREMENT 序列只在 INSERT 时推进，UPDATE 不消耗标识，之后
+    新建的预约仍紧接当前最大标识分配。
+  - 不改 id、不改 resource_id、不改 cancelled，也不触碰其他任何行
+    （包括每周重复预约持久化出的其他各条独立预约）。
+  - commit 后更新持久化：之后的 day-query / free-query（各自是独立
+    进程、重新打开同一数据库）立即按新时段显示，原时段不再被该预约
+    占用。
+
+5.4 为什么冲突后原时段保持不变
+
+冲突路径（booking/store.py:171-173）在 UPDATE 语句（174-177 行）
+之前就执行 conn.rollback() 并返回：
+
+    if has_conflict(...):
+        conn.rollback()
+        return None, "booking_conflict"
+    conn.execute("UPDATE bookings SET start = ?, end = ? WHERE id = ?", ...)
+
+因此冲突时该事务内没有执行过任何 UPDATE——旧的 start/end 没有被改写，
+cancelled 列与其他记录更未被触碰；rollback 结束事务，也没有 commit。
+不会出现“旧时段已释放、新时段未写入”的中间结果：旧时段继续被目标
+预约占用（对它再次 reserve 仍会 booking_conflict），阻挡方预约完全
+不受影响。外层 except（booking/store.py:179-181）同样 rollback 后
+重抛，任何异常路径都不会半写。
+
+--------------------------------------------------------------------------------
+6. 阶段五：JSON 输出（booking/__main__.py:362-381）
+--------------------------------------------------------------------------------
+
+main() 根据 reschedule_booking 的返回值分三个分支：
+
+    resource_id, error = store.reschedule_booking(conn, booking_id, start, end)
+    if error == "booking_not_found":
+        return _emit({"error": "booking_not_found"}, 2)
+    if error == "booking_conflict":
+        # 冲突时存储层已回滚：原时段与取消状态均不变，
+        # 不会出现只释放旧时段的结果。
+        return _emit({"error": "booking_conflict"}, 2)
+    # 成功只回显四个字段；标识保持原值，时间保留输入文本。
+    return _emit(
+        {
+            "booking_id": booking_id,
+            "resource_id": resource_id,
+            "start": start,
+            "end": end,
+        },
+        0,
+    )
+
+  - 成功：标准输出上唯一一个 JSON 对象，顶层恰好四个字段
+    booking_id、resource_id、start、end；booking_id 是原标识，
+    resource_id 是目标行的原资源，start/end 是本次输入的完整时间
+    文本（对应新时段），退出码 0，标准错误为空。
+  - 失败：标准输出上唯一一个只含 error 一个键的 JSON 对象，取值为
+    booking_not_found 或 booking_conflict，退出码 2，标准错误为空。
+  - 连接最终在 finally 中关闭（booking/__main__.py:449-450）。
+
+--------------------------------------------------------------------------------
+7. 完整示例：共用同一份演示数据的两次改期
+--------------------------------------------------------------------------------
+
+以下命令在全新目录可完整复现，不依赖任何已有数据库，也不依赖当前日期
+或机器时区（时间固定按 UTC+08:00 解释）。资源与预约标识以命令的实际
+返回值为准——全新数据库下分别为 resource_id 1、booking_id 1 与 2。
+下列输出与退出码均已实测。
+
+7.1 准备数据（全新 SQLite 文件）
+
+    python3 -m booking --db demo.sqlite resource-add --name "会议室A"
+    # {"resource_id": 1, "name": "会议室A"}
+
+    python3 -m booking --db demo.sqlite reserve --resource 1 \
+        --start 2026-10-05T09:00 --end 2026-10-05T10:00
+    # {"booking_id": 1, "resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T10:00"}
+
+    python3 -m booking --db demo.sqlite reserve --resource 1 \
+        --start 2026-10-05T11:00 --end 2026-10-05T12:00
+    # {"booking_id": 2, "resource_id": 1, "start": "2026-10-05T11:00", "end": "2026-10-05T12:00"}
+
+此时资源 1 在 2026-10-05 有两条未取消预约：09:00-10:00（标识 1）、
+11:00-12:00（标识 2）。
+
+7.2 示例一：预约 1 改到 09:30-10:30（成功）
+
+    python3 -m booking --db demo.sqlite reschedule --booking 1 \
+        --start 2026-10-05T09:30 --end 2026-10-05T10:30
+    # 退出码 0，标准错误为空：
+    {"booking_id": 1, "resource_id": 1, "start": "2026-10-05T09:30", "end": "2026-10-05T10:30"}
+
+  - 输出顶层恰好 booking_id、resource_id、start、end 四个字段。
+  - booking_id 仍为 1（原标识不变，没有新增预约），resource_id 仍为
+    1（资源归属不变），start/end 完整时间文本对应新时段。
+  - 新时段 09:30-10:30 与预约 1 自己的旧时段 09:00-10:00 相交，但
+    目标行被 exclude_id 排除（第 5.2 节），自身不阻挡；与预约 2
+    （11:00-12:00）不相交。
+
+7.3 示例二：预约 1 再改到 10:30-11:30（冲突，沿用同一数据库）
+
+    python3 -m booking --db demo.sqlite reschedule --booking 1 \
+        --start 2026-10-05T10:30 --end 2026-10-05T11:30
+    # 退出码 2，标准错误为空：
+    {"error": "booking_conflict"}
+
+  - 目标行自身被排除；但预约 2（11:00-12:00）是同资源的其他未取消
+    预约，与 10:30-11:30 在 11:00-11:30 相交（左闭右开下严格不等号
+    成立），故冲突。
+  - 冲突分支在 UPDATE 之前回滚（第 5.4 节），预约 1 保持
+    09:30-10:30 不变，预约 2 保持 11:00-12:00 不变。
+
+7.4 day-query：返回更新后的两条记录
+
+    python3 -m booking --db demo.sqlite day-query --resource 1 \
+        --date 2026-10-05
+    # 退出码 0：
+    {"resource_id": 1, "date": "2026-10-05", "bookings": [{"booking_id": 1, "start": "2026-10-05T09:30", "end": "2026-10-05T10:30"}, {"booking_id": 2, "start": "2026-10-05T11:00", "end": "2026-10-05T12:00"}]}
+
+预约 1 显示的是第一次改期后的新时段 09:30-10:30（第二次冲突尝试未
+改动它），预约 2 原样；两条记录按 start 升序。
+
+7.5 free-query：当天 09:00-12:00 的空闲区间
+
+    python3 -m booking --db demo.sqlite free-query --resource 1 \
+        --start 2026-10-05T09:00 --end 2026-10-05T12:00
+    # 退出码 0：
+    {"resource_id": 1, "start": "2026-10-05T09:00", "end": "2026-10-05T12:00", "free_slots": [{"start": "2026-10-05T09:00", "end": "2026-10-05T09:30"}, {"start": "2026-10-05T10:30", "end": "2026-10-05T11:00"}]}
+
+两条未取消占用为 09:30-10:30 与 11:00-12:00，在 [09:00, 12:00)
+内切出两段最大连续空闲：09:00-09:30（30 分钟）与 10:30-11:00
+（30 分钟）。10:30 与 11:00 都是端点相接，相接处不产生零长度空闲项。
+
+7.6 冲突前后、重新打开同一数据库后结果相同
+
+  - 冲突尝试前后各执行一次 7.4 / 7.5 的查询，两次 JSON 输出逐字节
+    一致：冲突回滚没有留下任何痕迹（预约 1 仍占用 09:30-10:30，
+    原 09:00-09:30 仍空闲）。
+  - 每条命令都是独立进程，执行后即关闭数据库；之后再次运行同样的
+    day-query / free-query（即重新打开同一 SQLite 文件）输出相同。
+    把 demo.sqlite 复制为另一个文件名再查询，结果仍与 7.4 / 7.5
+    完全一致——更新已随 commit 持久化，回滚结果同样持久化。
+
+--------------------------------------------------------------------------------
+8. 错误边界与规则汇总（均已实测核对）
+--------------------------------------------------------------------------------
+
+8.1 invalid_input：在打开数据库之前结束
+
+下列情形统一输出 {"error": "invalid_input"}，退出码 2，标准错误为空，
+且发生在 store.connect 之前——不建库、不迁移旧库、不改动已有数据；
+即使标识恰好不存在、或时间本会冲突，invalid_input 的优先级也更高：
+
+  - 缺少 --booking / --start / --end 中任一参数；
+  - 携带 reschedule 不支持的参数，包括 --repeat-weeks、--resource；
+  - 非法预约标识：零（0、000）、负数、小数、非整数文本（abc、1.5）、
+    含首尾空白或夹在数字中间的换行等非数字字符（"1\n"）；
+  - 非法时间：非零填充、含秒、带时区后缀、非 ASCII 数字、无效日期
+    （2026-02-30）；
+  - 起止顺序错误：起止相等或开始晚于结束。
+
+8.2 booking_not_found：目标不存在、已取消或标识超过 2^63-1
+
+统一输出 {"error": "booking_not_found"}，退出码 2，标准错误为空：
+
+  - 标识在 [1, 2^63-1] 内但库中没有该预约：阶段 (4) 的 SELECT 返回
+    空行（booking/store.py:166）；
+  - 预约已取消（cancelled != 0）：同一分支返回 not_found，且不执行
+    任何 UPDATE——已取消记录不会借改期恢复，其取消状态保持不变，
+    day-query 缺省查询仍不返回它；
+  - 标识大于 2^63-1（如 9223372036854775808，含任意前导零）：阶段
+    (3) 在查询前短路；边界值 2^63-1 走普通查询，不存在时结论相同。
+
+8.3 booking_conflict 与冲突规则
+
+  - 新时段与同一资源的“其他”未取消预约按左闭右开 [start, end)
+    相交时，输出 {"error": "booking_conflict"}，退出码 2，标准错误
+    为空；检查与更新在单个 BEGIN IMMEDIATE 事务内，冲突时 UPDATE
+    之前回滚，原时段、取消状态与其他记录全部不变。
+  - 目标预约自身被 exclude_id 显式排除：新旧时段重叠乃至时段完全
+    不变都允许成功。
+  - 端点相接不冲突；已取消预约与其他资源的预约不阻挡；部分重叠、
+    完全相同、包含/被包含均冲突。
+
+8.4 固定的时间与比较规则
+
+  - 时间统一解释为固定 UTC+08:00 的本地时间（TIMEZONE_OFFSET，
+    booking/__main__.py:16），不随运行环境时区变化；只接受严格零
+    填充的 YYYY-MM-DDTHH:mm，数字位仅 ASCII 0-9；允许过去日期与
+    跨日区间，开始必须严格早于结束。
+  - 定宽文本的字典序即时间先后，冲突 SQL 与更新都直接按文本比较。
+
+8.5 不新增记录、不消耗标识的依据
+
+  - reschedule_booking 中唯一的写操作是
+    UPDATE bookings SET start = ?, end = ? WHERE id = ?
+    （booking/store.py:174-177），没有 INSERT、没有 DELETE：表行数
+    不变，AUTOINCREMENT 序列不推进，事后新建预约得到紧接当前最大
+    标识的下一个值；目标行 id 与 resource_id 不变，其他行（含每周
+    重复预约的其他各次）不受影响。
+  - 每周重复预约在库中只是若干各自独立的普通预约，改期只作用于
+    --booking 指定的一行；reschedule 也不提供 --repeat-weeks。
+
+8.6 “不改预约”不等于“绝不写文件”
+
+  invalid_input 在连接前返回，确实不建库、不迁移；但合法输入
+  （包括最终 booking_not_found / booking_conflict 的请求）会正常
+  打开数据库：文件不存在时初始化新库，旧库缺少 cancelled 列时自动
+  补齐（booking/store.py:31-38）。初始化与迁移只影响库结构，不改动
+  任何预约的业务字段。
+
+8.7 其他入口
+
+resource-add、reserve（含 --repeat-weeks）、cancel、resource-list、
+day-query、free-query 的既有行为以及数据库文件格式均不在本文修改
+范围，保持不变。
+================================================================================
